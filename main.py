@@ -9,7 +9,7 @@ load_dotenv()
 app = Flask(__name__)
 
 VK_GROUP_TOKEN = os.getenv("VK_GROUP_TOKEN")
-VK_CONFIRMATION_TOKEN = os.getenv("VK_CONFIRMATION_TOKEN")
+VK_CONFIRMATION_TOKEN = os.getenv("VK_CONFIRMATION_TOKEN", "c9c78fbe")
 VK_SECRET_KEY = os.getenv("VK_SECRET_KEY")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
