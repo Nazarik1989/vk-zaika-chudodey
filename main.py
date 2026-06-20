@@ -74,12 +74,9 @@ def is_placeholder(value: str | None) -> bool:
         return True
     return value.startswith("сюда_потом")
 
-def normalize(text: str) -> str:
-    text = (text or "").lower().strip()
-    text = text.replace("ё", "е")
-    text = re.sub(r"\s+", " ", text)
-    return text
 
+def normalize(text: str) -> str:
+    return (text or "").lower().strip()
 
 
 def contains_any(text: str, words: list[str]) -> bool:
@@ -646,5 +643,5 @@ def callback():
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
