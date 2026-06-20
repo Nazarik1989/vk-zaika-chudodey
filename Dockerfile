@@ -19,3 +19,4 @@ EXPOSE 5000
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 CMD python -c "import sys; sys.exit(0)"
 
 CMD ["sh", "-c", "gunicorn main:app --bind 0.0.0.0:${PORT:-5000} --workers 1 --timeout 120 --access-logfile - --error-logfile -"]
+# redeploy 20260620-122742
