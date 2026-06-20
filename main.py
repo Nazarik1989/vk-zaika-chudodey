@@ -558,28 +558,49 @@ def build_answer(user_id: int, user_text: str):
     if contains_any(text, ["что ты умеешь", "помощь", "команды", "начать", "старт"]):
         return capabilities_answer()
 
-    tarot_triggers = [
-        "таро", "карта", "карты", "расклад", "энергия месяца",
-        "карта дня", "подсказка на неделю", "совет карт", "важно увидеть"
-    ]
-
-    affirmation_triggers = [
-        "аффирмация", "аффирмации", "афирмация", "афирмации"
-    ]
-
-    motivation_triggers = [
-        "мотивация", "мотивируй", "поддержи", "поддержка",
-        "нет сил", "устала", "устал", "страшно", "не могу начать",
-        "опора", "вдохнови"
-    ]
-
-    if contains_any(text, tarot_triggers):
-        return handle_tarot(user_id, user_text)
-
-    if contains_any(text, affirmation_triggers):
+    # Аффирмации: ловим разные формы слова
+    if "аффирмац" in text or "афирмац" in text:
         return handle_affirmations(user_text)
 
-    if contains_any(text, motivation_triggers):
+    # Таро: ловим разные естественные формулировки
+    tarot_roots = [
+        "таро",
+        "карт",
+        "расклад",
+        "энергия месяца",
+        "подсказка на неделю",
+        "совет карт",
+        "важно увидеть",
+        "что мне важно",
+    ]
+
+    if contains_any(text, tarot_roots):
+        return handle_tarot(user_id, user_text)
+
+    # Мотивация и поддержка: ловим не только слово "мотивация"
+    motivation_roots = [
+        "мотивац",
+        "мотивир",
+        "поддерж",
+        "нет сил",
+        "устал",
+        "устала",
+        "тревож",
+        "страшно",
+        "не могу начать",
+        "опора",
+        "вдохнов",
+        "уверенность",
+        "уверенност",
+        "важным шагом",
+        "важный шаг",
+        "на работу",
+        "работа",
+        "начать",
+        "не сдаваться",
+    ]
+
+    if contains_any(text, motivation_roots):
         return handle_motivation(user_text)
 
     return general_openrouter_answer(user_text)
