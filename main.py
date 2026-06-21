@@ -81,6 +81,36 @@ def normalize(text: str) -> str:
     return text
 
 
+def clean_vk_text(text: str) -> str:
+    """Чистим ответ перед VK: убираем Markdown, особенно ###-заголовки."""
+    if not text:
+        return ""
+
+    text = str(text)
+
+    # Markdown-заголовки: ### Тема -> Тема
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+
+    # Частые markdown-символы, которые в VK выглядят мусором
+    text = text.replace("**", "")
+    text = text.replace("__", "")
+    text = text.replace("`", "")
+
+    # Одинокие звёздочки в начале строк тоже убираем
+    text = re.sub(r"(?m)^\s*\*\s+", "— ", text)
+
+    # Если модель всё равно вставила много решёток внутри строки
+    text = text.replace("###", "")
+    text = text.replace("##", "")
+
+    # Лишние пробелы перед переносами и слишком много пустых строк
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
+
 
 def contains_any(text: str, words: list[str]) -> bool:
     return any(word in text for word in words)
@@ -97,6 +127,8 @@ def parse_count(text: str, default_count: int = 5) -> int:
 
 def vk_send_message(user_id: int, text: str):
     """Отправка сообщения пользователю VK."""
+    text = clean_vk_text(text)
+
     if is_placeholder(VK_GROUP_TOKEN):
         print("VK_GROUP_TOKEN не настроен. Ответ не отправлен.")
         return
@@ -147,7 +179,7 @@ def call_openrouter(system_prompt: str, user_prompt: str, max_tokens: int = 650)
             print("OpenRouter unexpected response:", data)
             return None
 
-        return data["choices"][0]["message"]["content"].strip()
+        return clean_vk_text(data["choices"][0]["message"]["content"].strip())
 
     except Exception as error:
         print("OpenRouter error:", error)
@@ -177,6 +209,13 @@ def base_system_prompt() -> str:
 - не ставь диагнозы;
 - не отменяй врачей, психологов и специалистов;
 - при опасных темах мягко советуй обратиться за срочной помощью к близким или специалистам.
+
+Формат:
+- не используй Markdown-разметку;
+- не пиши ###, ##, #, **жирный текст** и кодовые блоки;
+- не делай заголовки через решётки;
+- пиши обычным текстом, красиво разбивая абзацами;
+- списки можно делать простыми строками с цифрами или тире, без markdown-заголовков.
 
 Ответ должен быть красивым, но не перегруженным.
 """
@@ -263,6 +302,7 @@ def tarot_single_answer(format_name: str, user_text: str, intro: str):
 5. Напомни коротко, что Таро — это символическая подсказка, не приговор.
 
 Без фатальности. Без запугивания. Без медицинских/финансовых гарантий.
+Не используй Markdown: без ###, ##, # и **жирного текста**.
 """
 
     ai_answer = call_openrouter(system_prompt, user_prompt, max_tokens=650)
@@ -306,6 +346,7 @@ def tarot_three_cards_answer(format_name: str, user_text: str, positions: list[s
 
 Ответ должен быть живым, достаточно развёрнутым, но без огромной простыни.
 Не пугай. Не обещай точных событий. Не делай диагнозов.
+Не используй Markdown: без ###, ##, # и **жирного текста**.
 """
 
     ai_answer = call_openrouter(system_prompt, user_prompt, max_tokens=900)
@@ -314,7 +355,7 @@ def tarot_three_cards_answer(format_name: str, user_text: str, positions: list[s
 
     answer = [f"Сделаем {format_name.lower()} ✨\n"]
     for position, card in zip(positions, cards):
-        answer.append(f"**{position}**\n🃏 {tarot_card_description(card)}.\n")
+        answer.append(f"{position}\n🃏 {tarot_card_description(card)}.\n")
 
     answer.append(
         "Общий смысл расклада: сейчас важно смотреть на ситуацию спокойнее, "
@@ -415,22 +456,59 @@ def extract_topic_after_markers(text: str, markers: list[str]) -> str | None:
     return None
 
 
+def detect_topic(text: str, known_topics: list[str], default_topic: str) -> str:
+    topic = extract_topic_after_markers(text, ["на тему", "для", "про", "на"])
+
+    if topic:
+        # Чистим служебные слова, чтобы не получалось "любовь пожалуйста"
+        topic = re.sub(r"\b(пожалуйста|плиз|плз|дай|сделай|подбери|мне)\b", "", topic).strip(" .,!?:;-")
+        if topic:
+            return topic
+
+    for known in known_topics:
+        if known in text:
+            return known
+
+    synonyms = {
+        "самооценк": "самооценку",
+        "приняти": "принятие себя",
+        "денег": "деньги",
+        "деньги": "деньги",
+        "финанс": "деньги",
+        "любов": "любовь",
+        "отношен": "отношения",
+        "уверенн": "уверенность",
+        "спокой": "спокойствие",
+        "тревож": "спокойствие",
+        "работ": "работу",
+        "успех": "успех",
+        "энерги": "энергию",
+        "женствен": "женственность",
+    }
+
+    for root, value in synonyms.items():
+        if root in text:
+            return value
+
+    return default_topic
+
+
 def handle_affirmations(user_text: str):
     text = normalize(user_text)
 
     count = parse_count(text, default_count=5)
-    topic = extract_topic_after_markers(text, ["на тему", "на", "для", "про"])
+    topic = detect_topic(text, AFFIRMATION_TOPICS, "внутреннюю опору")
 
-    has_specific_topic = bool(topic)
-    is_plural = "аффирмации" in text or "афирмации" in text
+    only_general_request = (
+        len(text.split()) <= 3
+        and not re.search(r"\b\d{1,2}\b", text)
+        and topic == "внутреннюю опору"
+    )
 
-    if not has_specific_topic and len(text.split()) <= 3:
+    if only_general_request:
         return affirmation_menu()
 
-    if not has_specific_topic:
-        topic = "внутреннюю опору"
-
-    if not is_plural and not re.search(r"\b\d{1,2}\b", text):
+    if "аффирмация" in text and "аффирмации" not in text and not re.search(r"\b\d{1,2}\b", text):
         count = 1
 
     system_prompt = base_system_prompt()
@@ -449,7 +527,8 @@ def handle_affirmations(user_text: str):
 - в настоящем времени;
 - красивые, но не слишком длинные.
 
-Если количество больше 1 — оформи списком.
+Если количество больше 1 — оформи простым нумерованным списком.
+Не используй Markdown: без ###, ##, # и **жирного текста**.
 """
 
     ai_answer = call_openrouter(system_prompt, user_prompt, max_tokens=650)
@@ -501,6 +580,7 @@ def handle_motivation(user_text: str):
 
 Не используй фразу "мягкий пинок".
 Не дави. Не обесценивай. Не пиши огромную простыню.
+Не используй Markdown: без ###, ##, # и **жирного текста**.
 """
 
     ai_answer = call_openrouter(system_prompt, user_prompt, max_tokens=650)
@@ -535,6 +615,7 @@ def general_openrouter_answer(user_text: str):
 - Не обещай точных предсказаний будущего. Таро подавай как символическую подсказку и повод прислушаться к себе.
 
 Ответ должен быть естественным, не слишком длинным: 3–8 предложений.
+Не используй Markdown: без ###, ##, # и **жирного текста**.
 """
 
     ai_answer = call_openrouter(system_prompt, user_prompt, max_tokens=500)
@@ -567,10 +648,15 @@ def build_answer(user_id: int, user_text: str):
             ["Суть ситуации", "Что влияет", "Совет"]
         )
 
-    if contains_any(text, ["что ты умеешь", "помощь", "команды", "начать", "старт"]):
+    help_phrases = [
+        "что ты умеешь", "помощь", "команды", "старт", "/start", "help", "/help",
+        "меню", "возможности", "как пользоваться"
+    ]
+
+    if text in help_phrases or contains_any(text, ["что можешь", "какие команды", "чем можешь помочь"]):
         return capabilities_answer()
 
-    # Аффирмации: ловим разные формы слова
+    # Аффирмации: ловим разные формы и частую опечатку
     if "аффирмац" in text or "афирмац" in text:
         return handle_affirmations(user_text)
 
@@ -578,20 +664,20 @@ def build_answer(user_id: int, user_text: str):
         "таро",
         "карт",
         "расклад",
-        "энерги",
-        "месяц",
+        "аркана",
+        "аркан",
+        "энерги месяца",
+        "карта дня",
         "подсказк",
         "недел",
         "совет карт",
         "важно увидеть",
         "что мне важно",
     ]
-    
 
     if contains_any(text, tarot_roots):
         return handle_tarot(user_id, user_text)
 
-    # Мотивация и поддержка: ловим не только слово "мотивация"
     motivation_roots = [
         "мотивац",
         "мотивир",
@@ -599,25 +685,33 @@ def build_answer(user_id: int, user_text: str):
         "нет сил",
         "устал",
         "устала",
+        "выгор",
         "тревож",
+        "тревога",
         "страшно",
         "не могу начать",
+        "не получается начать",
+        "собраться",
         "опора",
         "вдохнов",
-        "уверенность",
-        "уверенност",
-        "важным шагом",
-        "важный шаг",
-        "на работу",
-        "работа",
-        "начать",
+        "нужен пинок",
+        "дай пинок",
         "не сдаваться",
+        "тяжело",
+        "плохо",
+        "груст",
+        "одинок",
+        "хочу поговорить",
+        "поговори со мной",
+        "важный шаг",
+        "важным шагом",
     ]
 
     if contains_any(text, motivation_roots):
         return handle_motivation(user_text)
 
     return general_openrouter_answer(user_text)
+
 
 
 @app.route("/", methods=["GET"])
@@ -645,6 +739,8 @@ def callback():
     event_type = data.get("type")
 
     if event_type == "confirmation":
+        if not is_placeholder(VK_CONFIRMATION_TOKEN):
+            return VK_CONFIRMATION_TOKEN
         return "c9c78fbe"
 
     if event_type == "message_new":
@@ -652,8 +748,10 @@ def callback():
         user_id = message.get("from_id")
         user_text = message.get("text", "")
 
+        print(f"VK_INCOMING from_id={user_id} text={user_text}", flush=True)
+
         if user_id and user_text:
-            answer = build_answer(user_id, user_text)
+            answer = clean_vk_text(build_answer(user_id, user_text))
             vk_send_message(user_id, answer)
 
         return "ok"
