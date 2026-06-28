@@ -211,31 +211,116 @@ def extract_topic_after_markers(text: str) -> str:
     t = norm(raw)
 
     patterns = [
-        r"(?:расклад|подсказк[ауи]?|совет|карту|карта|таро)\s+(?:на|по|про|о|об|для|насчет|по поводу)\s+(.+)",
-        r"(?:сделай|дай|посмотри|вытащи|вытяни|хочу|нужен|нужна)\s+(?:мне\s+)?(?:расклад|подсказк[ауи]?|совет|карту|таро)\s*(?:на|по|про|о|об|для|насчет|по поводу)?\s*(.+)",
+        r"(?:расклад|подсказк[ауи]?|совет|карту|карта|карты|картам|таро)\s+(?:на|по|про|о|об|для|насчет|по поводу)\s+(.+)",
+        r"(?:сделай|дай|посмотри|вытащи|вытяни|хочу|нужен|нужна)\s+(?:мне\s+)?(?:расклад|подсказк[ауи]?|совет|карту|карта|карты|таро)\s*(?:на|по|про|о|об|для|насчет|по поводу)?\s*(.+)",
         r"(?:что\s+(?:меня|мне)\s+ждет|что\s+будет)\s+(.+)",
-        r"(?:стоит\s+ли|нужно\s+ли|можно\s+ли)\s+(.+)",
+        r"(?:стоит\s+ли|нужно\s+ли|надо\s+ли|можно\s+ли)\s+(.+)",
         r"(?:по поводу)\s+(.+)",
     ]
-    for p in patterns:
-        m = re.search(p, t, flags=re.I)
+    for pat in patterns:
+        m = re.search(pat, t, flags=re.I)
         if m:
-            topic = m.group(1).strip(" .?!,:;—-")
-            topic = re.sub(r"^(сейчас|сегодня|пожалуйста|плиз|мне|я)\s+", "", topic).strip()
-            if topic and topic not in {"расклад", "таро", "карту", "карта", "совет", "подсказку"}:
+            topic = cleanup_topic(m.group(1))
+            if is_meaningful_topic(topic):
                 return topic[:180]
 
-    # Clean command words and use the rest as topic if it still looks meaningful.
     cleaned = re.sub(
-        r"\b(сделай|дай|посмотри|вытяни|вытащи|хочу|нужен|нужна|мне|пожалуйста|плиз|расклад|таро|карту|карта|совет|подсказку|подсказка|на|по|про|о|об|для)\b",
+        r"\b(сделай|дай|посмотри|вытяни|вытащи|хочу|нужен|нужна|мне|пожалуйста|плиз|расклад|таро|карту|карта|карты|картам|картами|совет|подсказку|подсказка|на|по|про|о|об|для|давай)\b",
         " ",
         t,
         flags=re.I,
     )
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .?!,:;—-")
-    if len(cleaned) >= 4:
+    cleaned = cleanup_topic(cleaned)
+    if is_meaningful_topic(cleaned):
         return cleaned[:180]
     return ""
+
+
+def cleanup_topic(topic: str) -> str:
+    topic = (topic or "").strip().lower().replace("ё", "е")
+    topic = topic.strip(" .?!,:;—-")
+    topic = re.sub(r"^(сейчас|сегодня|пожалуйста|плиз|мне|я|давай|ну|а)\s+", "", topic).strip()
+    topic = re.sub(r"\s+", " ", topic).strip(" .?!,:;—-")
+    return topic
+
+
+def is_meaningful_topic(topic: str) -> bool:
+    topic = cleanup_topic(topic)
+    if len(topic) < 4:
+        return False
+    trash = {
+        "расклад", "таро", "карту", "карта", "карты", "картам", "картами",
+        "совет", "подсказку", "подсказка", "по картам", "давай картам",
+        "давай по картам", "посмотри по картам", "через карты", "карт",
+    }
+    if topic in trash:
+        return False
+    if re.fullmatch(r"(?:давай|посмотри|сделай|хочу|можно)?\s*(?:по|через)?\s*(?:карт|карты|картам|картами|таро|расклад)\s*", topic):
+        return False
+    return True
+
+
+def is_soft_decision_question(text: str) -> bool:
+    t = norm(text)
+    markers = (
+        "стоит ли", "нужно ли", "надо ли", "можно ли", "как быть", "что делать",
+        "не знаю", "сомнева", "выбор", "выбрать", "решиться",
+        "менять", "смен", "уходить", "уволь", "переезд", "ехать", "поезд",
+        "отнош", "работ", "деньг", "покуп", "продаж", "дом", "квартир",
+    )
+    return any(m in t for m in markers)
+
+
+def extract_life_topic(text: str) -> str:
+    t = norm(text)
+    patterns = [
+        r"(?:стоит\s+ли|нужно\s+ли|надо\s+ли|можно\s+ли)\s+(.+)",
+        r"(?:я\s+переживаю\s+за|переживаю\s+за|тревожусь\s+за|боюсь\s+за)\s+(.+)",
+        r"(?:сомневаюсь\s+насчет|сомневаюсь\s+по поводу)\s+(.+)",
+        r"(?:что\s+делать\s+с|как\s+быть\s+с)\s+(.+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, t, flags=re.I)
+        if m:
+            topic = cleanup_topic(m.group(1))
+            if is_meaningful_topic(topic):
+                return topic[:180]
+
+    topic = extract_topic_after_markers(t)
+    if is_meaningful_topic(topic):
+        return topic
+    return ""
+
+
+def is_tarot_continuation_to_previous_topic(text: str) -> bool:
+    t = norm(text)
+    compact = re.sub(r"\s+", " ", t).strip()
+    phrases = {
+        "да", "давай", "хочу", "можно", "конечно", "ага", "ок", "окей",
+        "давай по картам", "по картам", "посмотри по картам", "смотрим по картам",
+        "давай через карты", "через карты", "хочу по картам", "можно по картам",
+        "давай расклад", "сделай расклад", "сделай по картам", "давай таро", "хочу таро",
+    }
+    if compact in phrases:
+        return True
+    if re.fullmatch(r"(?:давай|хочу|можно|посмотри|сделай)?\s*(?:по|через)?\s*(?:карты|картам|картами|таро|расклад)\s*", compact):
+        return True
+    return False
+
+
+def is_single_card_request(text: str) -> bool:
+    t = norm(text)
+    if "расклад" in t or "3 карт" in t or "три карт" in t:
+        return False
+    return (
+        "карта дня" in t
+        or "одну карту" in t
+        or "1 карту" in t
+        or "вытяни карту" in t
+        or "вытащи карту" in t
+        or "достань карту" in t
+        or re.search(r"\bкарту\b", t) is not None
+    )
 
 
 # -----------------------------
@@ -444,6 +529,27 @@ def is_plain_tarot_menu_request(text: str) -> bool:
 # -----------------------------
 # Bot answers
 # -----------------------------
+def greeting_answer(user_name: Optional[str] = None, compact: bool = False) -> str:
+    name = first_name_part(user_name)
+    hello = f"Привет, {name}!" if name else "Привет!"
+    if compact:
+        return (
+            f"{hello} Я здесь. Можешь написать обычными словами, что нужно: "
+            "поддержка, аффирмации, мотивация, карта дня или расклад."
+        )
+    return (
+        f"{hello} Я на связи и могу помочь в нескольких форматах:\n\n"
+        "🃏 карта дня;\n"
+        "🌙 подсказка на неделю;\n"
+        "🔮 расклад на ситуацию из 3 карт;\n"
+        "❓ расклад на вопрос;\n"
+        "💬 мягкая поддержка;\n"
+        "✨ аффирмации;\n"
+        "🔥 мотивация и настрой.\n\n"
+        "Напиши живыми словами, что сейчас нужно. Например: “стоит ли менять работу”, “давай по картам” или “дай 7 аффирмаций на любовь”."
+    )
+
+
 def capabilities_answer(user_name: Optional[str] = None, compact: bool = False) -> str:
     prefix = maybe_name(user_name)
     if compact:
@@ -534,23 +640,30 @@ def handle_tarot(user_id: int, user_text: str, user_name: Optional[str] = None) 
     state = get_user_state(user_id)
     t = norm(user_text)
 
-    # Continuation: user says yes after previous tarot offer/menu.
-    if t in {"да", "давай", "хочу", "можно", "конечно", "ага", "ок", "окей", "подскажи", "сделай"}:
+    # Если человек после обычного совета пишет “давай по картам”,
+    # берём прошлую тему, а не делаем тему “картам”.
+    if is_tarot_continuation_to_previous_topic(user_text):
         last_topic = state.get("last_topic") or "текущая ситуация"
         update_user_state(user_id, last_intent="tarot_spread", last_topic=last_topic, last_format="3_cards")
-        return tarot_three_cards_answer("Давай посмотрим это через расклад из 3 карт.", f"расклад на {last_topic}")
+        return tarot_three_cards_answer(
+            "Давай посмотрим это через расклад из 3 карт",
+            f"расклад на {last_topic}",
+            ["что сейчас влияет", "что может открыться дальше", "совет карт"],
+        )
 
     if is_plain_tarot_menu_request(user_text):
         update_user_state(user_id, last_intent="tarot_menu", last_topic="", last_format="")
         return tarot_menu(user_name)
 
     topic = extract_topic_after_markers(user_text)
+    if not is_meaningful_topic(topic):
+        topic = state.get("last_topic") or ""
 
     if "недел" in t:
         update_user_state(user_id, last_intent="tarot_week", last_topic=topic or "неделя", last_format="week")
         return tarot_three_cards_answer(
             "Подсказка на неделю",
-            user_text,
+            user_text if topic else "расклад на неделю",
             ["главная энергия недели", "что может поддержать", "бережный совет"],
         )
 
@@ -558,20 +671,21 @@ def handle_tarot(user_id: int, user_text: str, user_name: Optional[str] = None) 
         update_user_state(user_id, last_intent="tarot_month", last_topic=topic or "месяц", last_format="month")
         return tarot_three_cards_answer(
             "Энергия месяца",
-            user_text,
+            user_text if topic else "расклад на месяц",
             ["главная энергия месяца", "зона роста", "совет на месяц"],
         )
 
-    if "карта дня" in t or ("карт" in t and "дня" in t):
-        update_user_state(user_id, last_intent="tarot_day", last_topic="день", last_format="single")
-        return tarot_single_answer("Карта дня", user_text, intro="Посмотрим мягкую подсказку на сегодня ✨")
+    if is_single_card_request(user_text):
+        update_user_state(user_id, last_intent="tarot_single", last_topic=topic or "текущая ситуация", last_format="single")
+        title = "Карта дня" if "дня" in t else "Одна карта"
+        return tarot_single_answer(title, user_text if topic else f"карта на {topic or 'текущую ситуацию'}", intro="Посмотрим мягкую подсказку ✨")
 
-    # If they ask for a spread with a real topic, do it, not menu.
-    if "расклад" in t or topic:
+    # Если явно просят расклад или есть нормальная тема, делаем расклад, не меню.
+    if "расклад" in t or is_meaningful_topic(topic):
         update_user_state(user_id, last_intent="tarot_spread", last_topic=topic or "текущая ситуация", last_format="3_cards")
         return tarot_three_cards_answer(
             "Расклад из 3 карт",
-            user_text if topic else "расклад на текущую ситуацию",
+            user_text if is_meaningful_topic(extract_topic_after_markers(user_text)) else f"расклад на {topic or 'текущую ситуацию'}",
             ["что сейчас влияет", "что может открыться дальше", "совет карт"],
         )
 
@@ -635,7 +749,8 @@ def handle_motivation(user_id: int, user_text: str, user_name: Optional[str] = N
 
 
 def handle_support(user_id: int, user_text: str, user_name: Optional[str] = None) -> str:
-    update_user_state(user_id, last_intent="support", last_topic="", last_format="")
+    topic = extract_life_topic(user_text)
+    update_user_state(user_id, last_intent="support", last_topic=topic, last_format="")
     name = first_name_part(user_name)
     context = build_memory_context(user_id)
     prompt = (
@@ -772,10 +887,10 @@ def build_answer(user_id: int, user_text: str, user_name: Optional[str] = None) 
     try:
         if is_short_greeting(user_text):
             if state.get("greeted"):
-                answer = capabilities_answer(user_name, compact=True)
+                answer = greeting_answer(user_name, compact=True)
             else:
                 update_user_state(user_id, greeted=1, last_intent="greeting")
-                answer = capabilities_answer(user_name)
+                answer = greeting_answer(user_name)
         elif wants_capabilities(user_text):
             update_user_state(user_id, greeted=1, last_intent="capabilities")
             answer = capabilities_answer(user_name)
@@ -791,10 +906,15 @@ def build_answer(user_id: int, user_text: str, user_name: Optional[str] = None) 
             # Если пользователь только что выбрал Таро-меню, следующую тему можно принять
             # как тему расклада. В остальных случаях обычные жизненные фразы не уводим в Таро.
             last_intent = state.get("last_intent") or ""
-            if last_intent in {"tarot_menu", "tarot_offer"} and len(user_text) > 3:
-                answer = handle_tarot(user_id, f"расклад на {user_text}", user_name)
+            if last_intent in {"tarot_menu", "tarot_offer"} and len(user_text) > 3 and is_tarot_continuation_to_previous_topic(user_text):
+                answer = handle_tarot(user_id, user_text, user_name)
             else:
-                update_user_state(user_id, last_intent="dialogue")
+                topic = extract_life_topic(user_text)
+                if is_soft_decision_question(user_text) and is_meaningful_topic(topic):
+                    # Запоминаем тему, чтобы следующее “давай по картам” относилось к этому вопросу.
+                    update_user_state(user_id, last_intent="tarot_offer", last_topic=topic, last_format="")
+                else:
+                    update_user_state(user_id, last_intent="dialogue", last_topic=topic or state.get("last_topic") or "", last_format="")
                 answer = general_openrouter_answer(user_id, user_text, user_name)
     except Exception as e:
         print(f"BUILD_ANSWER_ERROR user_id={user_id} error={e}", flush=True)
