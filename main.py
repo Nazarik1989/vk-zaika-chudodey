@@ -187,11 +187,28 @@ def first_name_part(name: Optional[str]) -> str:
 
 
 def maybe_name(user_name: Optional[str]) -> str:
+    # Имя используем в явном приветствии.
+    # В обычных ответах не подставляем имя, чтобы бот не звучал навязчиво.
+    return ""
+
+
+def remove_leading_name_vocative(text: str, user_name: Optional[str]) -> str:
+    """Убирает навязчивое обращение по имени в начале AI-ответа.
+    Например: «Понимаю, Варвара. ...» -> «Понимаю. ...»
+    """
     name = first_name_part(user_name)
-    if not name:
-        return ""
-    # Do not overuse the name.
-    return f"{name}, " if random.random() < 0.45 else ""
+    if not name or not text:
+        return text
+    escaped = re.escape(name)
+    cleaned = text.strip()
+    cleaned = re.sub(rf"^({escaped})\s*[,!—-]+\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        rf"^(Понимаю|Хорошо|Конечно|Да|Смотри|Знаешь|Похоже|Я рядом)\s*,\s*{escaped}\s*([.!?])?\s*",
+        lambda m: f"{m.group(1)}. ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return cleaned.strip()
 
 
 def is_short_greeting(text: str) -> bool:
@@ -758,14 +775,15 @@ def handle_support(user_id: int, user_text: str, user_name: Optional[str] = None
         "Пользователь пишет, что ему тяжело или нужна поддержка. "
         "Ответь бережно, по-человечески, без медицинских диагнозов и без давления. "
         "Не выдавай меню. Можешь задать один мягкий уточняющий вопрос в конце. "
+        "Не обращайся к пользователю по имени в этом ответе, даже если имя известно. "
         "Без Markdown.\n"
-        f"Имя пользователя: {name or 'неизвестно'}.\n"
+        f"Имя пользователя известно: {name or 'неизвестно'}, но используй его только как внутренний контекст.\n"
         f"Контекст последних сообщений:\n{context}\n"
         f"Сообщение пользователя: {user_text}"
     )
     ai = openrouter_simple(prompt, max_tokens=650)
     if ai:
-        return clean_vk_text(ai)
+        return clean_vk_text(remove_leading_name_vocative(ai, user_name))
     return (
         f"{maybe_name(user_name)}я рядом. Похоже, сейчас правда непросто. "
         "Давай не будем требовать от себя сразу больших решений. Сделай один маленький шаг: выдохни, назови, что именно давит сильнее всего, и напиши мне."
@@ -859,14 +877,15 @@ def general_openrouter_answer(user_id: int, user_text: str, user_name: Optional[
         "Если пользователь НЕ просит явно карты, Таро, расклад или гадание, не уводи ответ в Таро. "
         "На жизненные вопросы вроде 'стоит ли менять работу' отвечай как мягкий собеседник: решение остаётся за человеком, помоги посмотреть на чувства, риски и варианты. "
         "В конце можно коротко предложить: если хочешь, можем отдельно посмотреть через карты. "
-        "Не давай медицинские, юридические или финансовые гарантии.\n"
-        f"Имя пользователя: {name or 'неизвестно'}. Иногда можешь обратиться по имени, но не часто.\n"
+        "Не давай медицинские, юридические или финансовые гарантии. "
+        "Важно: не обращайся к пользователю по имени в обычных ответах. Имя можно использовать только в первом приветствии.\n"
+        f"Имя пользователя известно: {name or 'неизвестно'}, но не вставляй его в текст ответа.\n"
         f"Контекст последних сообщений:\n{context}\n"
         f"Новое сообщение пользователя: {user_text}"
     )
     ai = openrouter_simple(prompt, max_tokens=800)
     if ai:
-        return clean_vk_text(ai)
+        return clean_vk_text(remove_leading_name_vocative(ai, user_name))
     return soft_dialogue_fallback(user_text, user_name)
 
 
