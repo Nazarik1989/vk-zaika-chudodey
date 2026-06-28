@@ -1,6 +1,10 @@
 import os
 import re
 import random
+import sqlite3
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
 import requests
 from flask import Flask, request
 from dotenv import load_dotenv
@@ -9,877 +13,847 @@ load_dotenv()
 
 app = Flask(__name__)
 
-VK_GROUP_TOKEN = os.getenv("VK_GROUP_TOKEN")
-VK_CONFIRMATION_TOKEN = os.getenv("VK_CONFIRMATION_TOKEN")
-VK_SECRET_KEY = os.getenv("VK_SECRET_KEY")
-VK_GROUP_ID = os.getenv("VK_GROUP_ID", "232950079")
-VK_MEMBERS_ONLY = os.getenv("VK_MEMBERS_ONLY", "true").lower() not in ("0", "false", "no", "off")
-
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
-
-VK_API_VERSION = os.getenv("VK_API_VERSION", "5.199")
-BOT_NAME = os.getenv("BOT_NAME", "Зайка-Чудодей")
-
-# Простая память диалога. После перезапуска сервера очищается.
-USER_STATE = {}
-USER_PROFILES = {}
-
-TAROT_CARDS = [
-    "Шут", "Маг", "Жрица", "Императрица", "Император",
-    "Иерофант", "Влюблённые", "Колесница", "Сила", "Отшельник",
-    "Колесо Фортуны", "Справедливость", "Повешенный", "Смерть",
-    "Умеренность", "Дьявол", "Башня", "Звезда", "Луна", "Солнце",
-    "Суд", "Мир"
-]
-
-TAROT_MEANINGS = {
-    "Шут": "новое начало, доверие пути, свежий взгляд",
-    "Маг": "действие, личная сила, умение влиять на ситуацию",
-    "Жрица": "интуиция, тишина, скрытое знание",
-    "Императрица": "рост, забота, плодородие идей",
-    "Император": "структура, опора, ответственность",
-    "Иерофант": "мудрость, традиции, наставничество",
-    "Влюблённые": "выбор, отношения, согласие с собой",
-    "Колесница": "движение, воля, управление направлением",
-    "Сила": "мягкая внутренняя мощь, терпение, самообладание",
-    "Отшельник": "пауза, поиск смысла, внутренний ответ",
-    "Колесо Фортуны": "перемены, цикл, неожиданный поворот",
-    "Справедливость": "честность, баланс, последствия решений",
-    "Повешенный": "новый взгляд, пауза, переоценка",
-    "Смерть": "завершение этапа, освобождение, обновление",
-    "Умеренность": "гармония, исцеление, спокойный ритм",
-    "Дьявол": "привязанности, искушения, честный взгляд на зависимости",
-    "Башня": "разрушение старого, правда, освобождение от иллюзий",
-    "Звезда": "надежда, вдохновение, мягкое восстановление",
-    "Луна": "сомнения, эмоции, неясность, интуиция",
-    "Солнце": "ясность, радость, энергия, открытость",
-    "Суд": "пробуждение, важный вывод, переход на новый уровень",
-    "Мир": "завершение, целостность, результат"
-}
-
-AFFIRMATION_TOPICS = [
-    "любовь", "уверенность", "спокойствие", "деньги",
-    "отношения", "принятие себя", "энергия", "счастье",
-    "женственность", "самооценка", "работа", "успех"
-]
-
-MOTIVATION_TOPICS = [
-    "поддержка в усталости", "мотивация на работу",
-    "уверенность перед шагом", "спокойный план на день",
-    "поддержка в тревоге", "внутренняя опора",
-    "начать новое", "не сдаваться"
-]
-
-
-def is_placeholder(value: str | None) -> bool:
-    if not value:
-        return True
-    return value.startswith("сюда_потом")
-
-def normalize(text: str) -> str:
-    text = (text or "").lower().strip()
-    text = text.replace("ё", "е")
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
-def clean_vk_text(text: str) -> str:
-    """Чистим ответ перед VK: убираем Markdown, особенно ###-заголовки."""
-    if not text:
-        return ""
-
-    text = str(text)
-
-    # Markdown-заголовки: ### Тема -> Тема
-    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
-
-    # Частые markdown-символы, которые в VK выглядят мусором
-    text = text.replace("**", "")
-    text = text.replace("__", "")
-    text = text.replace("`", "")
-
-    # Одинокие звёздочки в начале строк тоже убираем
-    text = re.sub(r"(?m)^\s*\*\s+", "— ", text)
-
-    # Если модель всё равно вставила много решёток внутри строки
-    text = text.replace("###", "")
-    text = text.replace("##", "")
-
-    # Лишние пробелы перед переносами и слишком много пустых строк
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    return text.strip()
-
-
-
-
-def contains_any(text: str, words: list[str]) -> bool:
-    return any(word in text for word in words)
-
-
-def parse_count(text: str, default_count: int = 5) -> int:
-    match = re.search(r"\b(\d{1,2})\b", text)
-    if not match:
-        return default_count
-
-    count = int(match.group(1))
-    return max(1, min(count, 10))
-
-
-def vk_send_message(user_id: int, text: str):
-    """Отправка сообщения пользователю VK."""
-    text = clean_vk_text(text)
-
-    if is_placeholder(VK_GROUP_TOKEN):
-        print("VK_GROUP_TOKEN не настроен. Ответ не отправлен.")
-        return
-
-    url = "https://api.vk.com/method/messages.send"
-    payload = {
-        "user_id": user_id,
-        "message": text[:3900],
-        "random_id": random.randint(1, 2_000_000_000),
-        "access_token": VK_GROUP_TOKEN,
-        "v": VK_API_VERSION,
-    }
-
-    try:
-        response = requests.post(url, data=payload, timeout=10)
-        print("VK response:", response.text)
-    except Exception as error:
-        print("VK send error:", error)
-
-
-
-
-def get_callback_group_id(data: dict) -> int | None:
-    """Берём ID сообщества из события VK или из переменной окружения."""
-    raw_group_id = data.get("group_id") or VK_GROUP_ID
-    try:
-        return int(raw_group_id)
-    except (TypeError, ValueError):
-        return None
-
-
-def vk_is_group_member(user_id: int, group_id: int | None) -> bool:
-    """Проверяем, подписан ли пользователь на VK-сообщество."""
-    if not VK_MEMBERS_ONLY:
-        return True
-
-    if not user_id or not group_id:
-        print("VK member check skipped: no user_id or group_id", flush=True)
-        return False
-
-    if is_placeholder(VK_GROUP_TOKEN):
-        print("VK member check failed: VK_GROUP_TOKEN is not configured", flush=True)
-        return False
-
-    try:
-        response = requests.get(
-            "https://api.vk.com/method/groups.isMember",
-            params={
-                "group_id": abs(int(group_id)),
-                "user_id": int(user_id),
-                "access_token": VK_GROUP_TOKEN,
-                "v": VK_API_VERSION,
-            },
-            timeout=10,
-        )
-        data = response.json()
-        print("VK member check:", data, flush=True)
-
-        if "response" in data:
-            return bool(int(data.get("response", 0)))
-
-        return False
-    except Exception as error:
-        print("VK member check error:", error, flush=True)
-        return False
-
-
-def membership_required_answer() -> str:
-    return (
-        "Привет ✨\n\n"
-        "Я отвечаю только подписчикам сообщества «Зайчинки-чудодеи».\n"
-        "Подпишись на группу, а потом напиши мне снова — и я сразу помогу с Таро, аффирмациями или поддержкой 🌿"
-    )
-
-
-def vk_get_user_name(user_id: int) -> str | None:
-    """Берём имя пользователя из VK и кэшируем, чтобы бот мог обращаться по имени."""
-    if not user_id or is_placeholder(VK_GROUP_TOKEN):
-        return None
-
-    if user_id in USER_PROFILES:
-        return USER_PROFILES[user_id].get("first_name")
-
-    try:
-        response = requests.get(
-            "https://api.vk.com/method/users.get",
-            params={
-                "user_ids": int(user_id),
-                "access_token": VK_GROUP_TOKEN,
-                "v": VK_API_VERSION,
-            },
-            timeout=10,
-        )
-        data = response.json()
-        print("VK user profile:", data, flush=True)
-
-        users = data.get("response", [])
-        if users:
-            first_name = users[0].get("first_name")
-            if first_name:
-                USER_PROFILES[user_id] = {"first_name": first_name}
-                return first_name
-    except Exception as error:
-        print("VK user profile error:", error, flush=True)
-
-    return None
-
-
-def personal_greeting(user_name: str | None) -> str:
-    if user_name:
-        return f"{user_name}, привет ✨"
-    return "Привет ✨"
-
-def call_openrouter(system_prompt: str, user_prompt: str, max_tokens: int = 650):
-    """Ответ через OpenRouter. Если ключа нет или ошибка — вернём None."""
-    if is_placeholder(OPENROUTER_API_KEY):
-        return None
-
-    try:
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": OPENROUTER_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.85,
-                "max_tokens": max_tokens,
-            },
-            timeout=30,
-        )
-
-        data = response.json()
-
-        if "choices" not in data:
-            print("OpenRouter unexpected response:", data)
-            return None
-
-        return clean_vk_text(data["choices"][0]["message"]["content"].strip())
-
-    except Exception as error:
-        print("OpenRouter error:", error)
-        return None
-
-
-def base_system_prompt(user_name: str | None = None) -> str:
-    name_instruction = ""
-    if user_name:
-        name_instruction = (
-            f"\nИмя пользователя: {user_name}. "
-            "Иногда можешь мягко обратиться к человеку по имени, "
-            "но не вставляй имя в каждое предложение.\n"
-        )
-
-    return f"""
-Ты {BOT_NAME}, мягкий VK-помощник для сообщества.
-{name_instruction}
-
-Главные направления:
-1. Таро-подсказки.
-2. Аффирмации.
-3. Мотивация и поддержка.
-
-Стиль:
-- живой диалог, не сухое меню;
-- тепло, бережно, понятно;
-- не используй фразу "мягкий пинок";
-- не пиши огромные простыни;
-- если человек просит общий раздел, мягко предложи варианты;
-- если человек уже дал конкретный запрос, сразу отвечай по делу;
-- обращайся на "ты", но без фамильярности;
-- не пугай;
-- не давай фатальных предсказаний;
-- Таро подавай как символическую подсказку, а не как приговор;
-- не ставь диагнозы;
-- не отменяй врачей, психологов и специалистов;
-- при опасных темах мягко советуй обратиться за срочной помощью к близким или специалистам.
-
-Формат:
-- не используй Markdown-разметку;
-- не пиши ###, ##, #, **жирный текст** и кодовые блоки;
-- не делай заголовки через решётки;
-- пиши обычным текстом, красиво разбивая абзацами;
-- списки можно делать простыми строками с цифрами или тире, без markdown-заголовков.
-
-Ответ должен быть красивым, но не перегруженным.
-"""
-
-
-def capabilities_answer(user_name: str | None = None):
-    return (
-        personal_greeting(user_name) + "\n\n"
-        "Я могу помочь в трёх направлениях:\n\n"
-        "🃏 Таро — карта дня, подсказка на неделю, расклад на ситуацию, энергия месяца.\n"
-        "🌷 Аффирмации — по теме любви, уверенности, спокойствия, денег, отношений и не только.\n"
-        "🌿 Мотивация — поддержка, слова опоры, настрой на день или помощь, когда тяжело начать.\n\n"
-        "Можно написать просто: «таро», «аффирмации» или «мотивация» — и я предложу подходящий формат."
-    )
-
-
-def tarot_menu(user_name: str | None = None):
-    return (
-        "Конечно ✨\n"
-        "Могу сделать Таро-подсказку в нескольких форматах:\n\n"
-        "🃏 карта дня;\n"
-        "🌙 подсказка на неделю;\n"
-        "🔮 расклад на ситуацию из 3 карт;\n"
-        "❔ расклад на вопрос;\n"
-        "🌌 энергия месяца;\n"
-        "🕯 совет карт;\n"
-        "👁 что мне важно увидеть сейчас.\n\n"
-        "Напиши, какой формат выбираешь, или задай свой вопрос своими словами."
-    )
-
-
-def affirmation_menu(user_name: str | None = None):
-    return (
-        "Конечно 🌷\n"
-        "Могу дать одну аффирмацию на сейчас или подборку по теме.\n\n"
-        "Например:\n"
-        "— аффирмации на любовь;\n"
-        "— 10 аффирмаций на уверенность;\n"
-        "— аффирмации на спокойствие;\n"
-        "— аффирмации на деньги;\n"
-        "— аффирмации на принятие себя;\n"
-        "— аффирмации на отношения.\n\n"
-        "Напиши тему и, если хочешь, количество."
-    )
-
-
-def motivation_menu(user_name: str | None = None):
-    return (
-        "Конечно 🌿\n"
-        "Могу поддержать в разных форматах:\n\n"
-        "— короткое мотивационное послание;\n"
-        "— поддержка в усталости;\n"
-        "— мотивация на работу;\n"
-        "— уверенность перед важным шагом;\n"
-        "— спокойный план на день;\n"
-        "— слова опоры, когда тревожно.\n\n"
-        "Напиши, что сейчас ближе."
-    )
-
-
-def tarot_card_description(card: str) -> str:
-    meaning = TAROT_MEANINGS.get(card, "символическая подсказка и повод прислушаться к себе")
-    return f"{card} — {meaning}"
-
-
-def tarot_single_answer(format_name: str, user_text: str, intro: str, user_name: str | None = None):
-    card = random.choice(TAROT_CARDS)
-
-    system_prompt = base_system_prompt(user_name)
-    user_prompt = f"""
-Сделай ответ в формате: {format_name}.
-
-Вытянутая карта: {card}.
-Краткое значение карты: {TAROT_MEANINGS.get(card)}.
-
-Запрос пользователя:
-{user_text}
-
-Структура ответа:
-1. Назови карту.
-2. Дай мягкую интерпретацию.
-3. Объясни, что карта подсвечивает.
-4. Дай бережный совет.
-5. Напомни коротко, что Таро — это символическая подсказка, не приговор.
-
-Без фатальности. Без запугивания. Без медицинских/финансовых гарантий.
-Не используй Markdown: без ###, ##, # и **жирного текста**.
-"""
-
-    ai_answer = call_openrouter(system_prompt, user_prompt, max_tokens=650)
-    if ai_answer:
-        return ai_answer
-
-    return (
-        f"{intro}\n\n"
-        f"🃏 Карта: {tarot_card_description(card)}.\n\n"
-        f"Эта карта мягко подсказывает: сейчас важно прислушаться к себе, "
-        f"не торопить события и выбрать самый честный следующий шаг.\n\n"
-        f"Таро здесь — символическая подсказка, не приговор."
-    )
-
-
-def tarot_three_cards_answer(format_name: str, user_text: str, positions: list[str], user_name: str | None = None):
-    cards = random.sample(TAROT_CARDS, 3)
-
-    card_lines = []
-    for position, card in zip(positions, cards):
-        card_lines.append(f"{position}: {card} — {TAROT_MEANINGS.get(card)}")
-
-    cards_text = "\n".join(card_lines)
-
-    system_prompt = base_system_prompt(user_name)
-    user_prompt = f"""
-Сделай Таро-ответ в формате: {format_name}.
-
-Вытянутые карты:
-{cards_text}
-
-Запрос пользователя:
-{user_text}
-
-Структура:
-1. Короткое вступление.
-2. Каждая карта отдельно: позиция, смысл, что подсвечивает.
-3. Общий вывод.
-4. Бережный совет.
-5. Напоминание: Таро — символическая подсказка, не приговор.
-
-Ответ должен быть живым, достаточно развёрнутым, но без огромной простыни.
-Не пугай. Не обещай точных событий. Не делай диагнозов.
-Не используй Markdown: без ###, ##, # и **жирного текста**.
-"""
-
-    ai_answer = call_openrouter(system_prompt, user_prompt, max_tokens=900)
-    if ai_answer:
-        return ai_answer
-
-    answer = [f"Сделаем {format_name.lower()} ✨\n"]
-    for position, card in zip(positions, cards):
-        answer.append(f"{position}\n🃏 {tarot_card_description(card)}.\n")
-
-    answer.append(
-        "Общий смысл расклада: сейчас важно смотреть на ситуацию спокойнее, "
-        "замечать не только внешние события, но и своё внутреннее состояние.\n\n"
-        "Таро — это символическая подсказка, не приговор."
-    )
-
-    return "\n".join(answer)
-
-
-def handle_tarot(user_id: int, user_text: str, user_name: str | None = None):
-    text = normalize(user_text)
-
-    general_tarot_words = ["таро", "карты", "расклад"]
-    
-    specific_words = [
-        "карта дня", "на день", "подсказк", "недел", "3 карт", "три карт",
-        "ситуац", "вопрос", "месяц", "совет", "важно увидеть",
-    ]
-    if contains_any(text, general_tarot_words) and not contains_any(text, specific_words):
-        return tarot_menu(user_name)
-
-    if "карта дня" in text or "на день" in text:
-        return tarot_single_answer(
-            "Карта дня",
-            user_text,
-            "Карта дня для тебя ✨",
-            user_name
-        )
-
-    if "недел" in text:
-        return tarot_three_cards_answer(
-            "Подсказка на неделю",
-            user_text,
-            ["Главная энергия недели", "Что может поддержать", "Совет"],
-            user_name
-        )
-
-    if "месяц" in text:
-        return tarot_three_cards_answer(
-            "Энергия месяца",
-            user_text,
-            ["Фон месяца", "Возможность", "На что обратить внимание"],
-            user_name
-        )
-
-    if "важно увидеть" in text:
-        return tarot_single_answer(
-            "Что мне важно увидеть сейчас",
-            user_text,
-            "Посмотрим, что сейчас важно заметить ✨",
-            user_name
-        )
-
-    if "совет" in text:
-        return tarot_single_answer(
-            "Совет карт",
-            user_text,
-            "Совет карт на сейчас ✨",
-            user_name
-        )
-
-    if (
-        "расклад" in text
-        or "3 карт" in text
-        or "три карт" in text
-        or "ситуац" in text
-        or "вопрос" in text
-    ):
-        # Если человек попросил расклад, но не описал ситуацию — уточняем.
-        short_request = len(text.split()) <= 7 and "?" not in text
-        if short_request:
-            USER_STATE[user_id] = {"awaiting": "tarot_question"}
-            return (
-                "Хорошо, сделаем расклад из 3 карт ✨\n\n"
-                "Напиши ситуацию или вопрос в одном-двух предложениях.\n"
-                "Я разложу так:\n"
-                "1. суть ситуации;\n"
-                "2. что влияет;\n"
-                "3. совет."
-            )
-
-        return tarot_three_cards_answer(
-            "Расклад на ситуацию из 3 карт",
-            user_text,
-            ["Суть ситуации", "Что влияет", "Совет"],
-            user_name
-        )
-
-    return tarot_single_answer(
-        "Таро-подсказка",
-        user_text,
-        "Посмотрим мягкую подсказку карт ✨",
-        user_name
-    )
-
-
-def extract_topic_after_markers(text: str, markers: list[str]) -> str | None:
-    for marker in markers:
-        if marker in text:
-            topic = text.split(marker, 1)[1].strip(" .,!?:;-")
-            topic = re.sub(r"\b\d{1,2}\b", "", topic).strip(" .,!?:;-")
-            if topic:
-                return topic
-    return None
-
-
-def detect_topic(text: str, known_topics: list[str], default_topic: str) -> str:
-    topic = extract_topic_after_markers(text, ["на тему", "для", "про", "на"])
-
-    if topic:
-        # Чистим служебные слова, чтобы не получалось "любовь пожалуйста"
-        topic = re.sub(r"\b(пожалуйста|плиз|плз|дай|сделай|подбери|мне)\b", "", topic).strip(" .,!?:;-")
-        if topic:
-            return topic
-
-    for known in known_topics:
-        if known in text:
-            return known
-
-    synonyms = {
-        "самооценк": "самооценку",
-        "приняти": "принятие себя",
-        "денег": "деньги",
-        "деньги": "деньги",
-        "финанс": "деньги",
-        "любов": "любовь",
-        "отношен": "отношения",
-        "уверенн": "уверенность",
-        "спокой": "спокойствие",
-        "тревож": "спокойствие",
-        "работ": "работу",
-        "успех": "успех",
-        "энерги": "энергию",
-        "женствен": "женственность",
-    }
-
-    for root, value in synonyms.items():
-        if root in text:
-            return value
-
-    return default_topic
-
-
-def handle_affirmations(user_text: str, user_name: str | None = None):
-    text = normalize(user_text)
-
-    count = parse_count(text, default_count=5)
-    topic = detect_topic(text, AFFIRMATION_TOPICS, "внутреннюю опору")
-
-    only_general_request = (
-        len(text.split()) <= 3
-        and not re.search(r"\b\d{1,2}\b", text)
-        and topic == "внутреннюю опору"
-    )
-
-    if only_general_request:
-        return affirmation_menu(user_name)
-
-    if "аффирмация" in text and "аффирмации" not in text and not re.search(r"\b\d{1,2}\b", text):
-        count = 1
-
-    system_prompt = base_system_prompt(user_name)
-    user_prompt = f"""
-Пользователь просит аффирмации.
-
-Тема: {topic}
-Количество: {count}
-
-Сделай {count} аффирмаций.
-Они должны быть:
-- тёплые;
-- простые;
-- без токсичной позитивности;
-- без обещаний невозможного;
-- в настоящем времени;
-- красивые, но не слишком длинные.
-
-Если количество больше 1 — оформи простым нумерованным списком.
-Не используй Markdown: без ###, ##, # и **жирного текста**.
-"""
-
-    ai_answer = call_openrouter(system_prompt, user_prompt, max_tokens=650)
-    if ai_answer:
-        return ai_answer
-
-    if count == 1:
-        return f"✨ Аффирмация на тему «{topic}»:\n\nЯ выбираю бережность к себе и доверяю своему пути."
-
-    lines = [f"✨ Аффирмации на тему «{topic}»:\n"]
-    templates = [
-        "Я разрешаю себе двигаться в своём темпе.",
-        "Я выбираю спокойствие и внутреннюю опору.",
-        "Я достойна/достоин любви, уважения и заботы.",
-        "Я могу делать маленькие шаги и всё равно идти вперёд.",
-        "Я слышу себя и доверяю своим чувствам.",
-        "Я открываюсь хорошему бережно и спокойно.",
-        "Я принимаю себя без давления и спешки.",
-        "Я создаю вокруг себя больше тепла и ясности.",
-        "Я имею право на поддержку.",
-        "Сегодня я выбираю быть на своей стороне."
-    ]
-
-    for i, phrase in enumerate(templates[:count], start=1):
-        lines.append(f"{i}. {phrase}")
-
-    return "\n".join(lines)
-
-
-def handle_motivation(user_text: str, user_name: str | None = None):
-    text = normalize(user_text)
-
-    if len(text.split()) <= 3 and contains_any(text, ["мотивация", "мотивируй", "поддержка"]):
-        return motivation_menu(user_name)
-
-    system_prompt = base_system_prompt(user_name)
-    user_prompt = f"""
-Пользователь просит мотивацию или поддержку.
-
-Сообщение пользователя:
-{user_text}
-
-Ответь живо и бережно.
-Структура:
-1. Коротко отрази состояние человека.
-2. Дай тёплую поддержку.
-3. Предложи 1-2 маленьких конкретных шага.
-4. Заверши спокойной фразой опоры.
-
-Не используй фразу "мягкий пинок".
-Не дави. Не обесценивай. Не пиши огромную простыню.
-Не используй Markdown: без ###, ##, # и **жирного текста**.
-"""
-
-    ai_answer = call_openrouter(system_prompt, user_prompt, max_tokens=650)
-    if ai_answer:
-        return ai_answer
-
-    return (
-        "Я рядом 🌿\n\n"
-        "Сейчас не нужно требовать от себя идеальности. "
-        "Попробуй выбрать один маленький шаг, который правда по силам: "
-        "открыть заметку, написать первое предложение, сделать один звонок или просто выдохнуть и начать с малого.\n\n"
-        "Не всё сразу. Один спокойный шаг уже считается."
-    )
-
-
-def general_openrouter_answer(user_text: str, user_name: str | None = None):
-    system_prompt = base_system_prompt(user_name)
-    user_prompt = f"""
-Сообщение пользователя:
-{user_text}
-
-Ответь как живой, тёплый помощник сообщества "Зайчинки-чудодеи".
-
-Главное:
-- Не ограничивайся меню и не повторяй список функций без необходимости.
-- Если человек просто общается, задаёт вопрос, делится состоянием, шутит или пишет обычную фразу — поддержи живым человеческим ответом.
-- Если человек явно просит Таро, аффирмации или мотивацию — помоги в этом формате.
-- Если запрос неясный — мягко уточни, что именно человек хочет.
-- Меню с возможностями показывай только если человек спрашивает: "что ты умеешь", "помощь", "старт", "команды".
-- Общайся на "ты", спокойно, бережно, без фразы "мягкий пинок".
-- Не ставь диагнозы, не давай медицинских, юридических и финансовых гарантий.
-- Не обещай точных предсказаний будущего. Таро подавай как символическую подсказку и повод прислушаться к себе.
-
-Ответ должен быть естественным, не слишком длинным: 3–8 предложений.
-Не используй Markdown: без ###, ##, # и **жирного текста**.
-"""
-
-    ai_answer = call_openrouter(system_prompt, user_prompt, max_tokens=500)
-    if ai_answer:
-        return ai_answer
-
-    return (
-        "Привет ✨\n\n"
-        "Я могу сделать Таро-подсказку, подобрать аффирмации или дать бережную мотивацию.\n"
-        "Напиши, что хочется сейчас: «таро», «аффирмации» или «мотивация»."
-    )
-
-
-def build_answer(user_id: int, user_text: str, user_name: str | None = None):
-    text = normalize(user_text)
-
-    if not text:
-        return f"{user_name + ", " if user_name else ""}напиши мне пару слов, и я подскажу, чем могу помочь ✨"
-
-    if text in ["отмена", "стоп", "не надо", "сброс"]:
-        USER_STATE.pop(user_id, None)
-        return "Хорошо, остановились. Можем начать заново, когда будет удобно 🌿"
-
-    state = USER_STATE.get(user_id)
-    if state and state.get("awaiting") == "tarot_question":
-        USER_STATE.pop(user_id, None)
-        return tarot_three_cards_answer(
-            "Расклад на ситуацию из 3 карт",
-            user_text,
-            ["Суть ситуации", "Что влияет", "Совет"],
-            user_name
-        )
-
-    help_phrases = [
-        "что ты умеешь", "помощь", "команды", "старт", "/start", "help", "/help",
-        "меню", "возможности", "как пользоваться"
-    ]
-
-    if text in help_phrases or contains_any(text, ["что можешь", "какие команды", "чем можешь помочь"]):
-        return capabilities_answer(user_name)
-
-    # Аффирмации: ловим разные формы и частую опечатку
-    if "аффирмац" in text or "афирмац" in text:
-        return handle_affirmations(user_text, user_name)
-
-    tarot_roots = [
-        "таро",
-        "карт",
-        "расклад",
-        "аркана",
-        "аркан",
-        "энерги месяца",
-        "карта дня",
-        "подсказк",
-        "недел",
-        "совет карт",
-        "важно увидеть",
-        "что мне важно",
-    ]
-
-    if contains_any(text, tarot_roots):
-        return handle_tarot(user_id, user_text, user_name)
-
-    motivation_roots = [
-        "мотивац",
-        "мотивир",
-        "поддерж",
-        "нет сил",
-        "устал",
-        "устала",
-        "выгор",
-        "тревож",
-        "тревога",
-        "страшно",
-        "не могу начать",
-        "не получается начать",
-        "собраться",
-        "опора",
-        "вдохнов",
-        "нужен пинок",
-        "дай пинок",
-        "не сдаваться",
-        "тяжело",
-        "плохо",
-        "груст",
-        "одинок",
-        "хочу поговорить",
-        "поговори со мной",
-        "важный шаг",
-        "важным шагом",
-    ]
-
-    if contains_any(text, motivation_roots):
-        return handle_motivation(user_text, user_name)
-
-    return general_openrouter_answer(user_text, user_name)
-
-
-
-@app.route("/", methods=["GET"])
-def index():
-    return "VK Zaika Chudodey bot is alive"
-
-
-
+VK_GROUP_TOKEN = os.getenv("VK_GROUP_TOKEN", "").strip()
+VK_CONFIRMATION_TOKEN = os.getenv("VK_CONFIRMATION_TOKEN", "").strip()
+VK_SECRET_KEY = os.getenv("VK_SECRET_KEY", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini").strip()
+VK_API_VERSION = os.getenv("VK_API_VERSION", "5.199").strip()
+BOT_NAME = os.getenv("BOT_NAME", "Зайка-чудодей").strip()
+VK_GROUP_ID = int(os.getenv("VK_GROUP_ID", "232950079") or "232950079")
+VK_MEMBERS_ONLY = os.getenv("VK_MEMBERS_ONLY", "true").strip().lower() in {"1", "true", "yes", "да", "on"}
+DB_PATH = os.getenv("DB_PATH", "zaika_memory.db").strip()
+MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "12") or "12")
+
+
+# -----------------------------
+# Health
+# -----------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return "ok", 200
 
+
+# -----------------------------
+# Persistent memory
+# -----------------------------
+def now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+
+def db_connect():
+    return sqlite3.connect(DB_PATH, timeout=10)
+
+
+def init_db() -> None:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                user_name TEXT,
+                greeted INTEGER DEFAULT 0,
+                last_intent TEXT,
+                last_topic TEXT,
+                last_format TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def get_user_state(user_id: int) -> Dict:
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            return {
+                "user_id": user_id,
+                "user_name": "",
+                "greeted": 0,
+                "last_intent": "",
+                "last_topic": "",
+                "last_format": "",
+            }
+        return dict(row)
+
+
+def update_user_state(user_id: int, **kwargs) -> None:
+    state = get_user_state(user_id)
+    state.update(kwargs)
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (user_id, user_name, greeted, last_intent, last_topic, last_format, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                user_name=excluded.user_name,
+                greeted=excluded.greeted,
+                last_intent=excluded.last_intent,
+                last_topic=excluded.last_topic,
+                last_format=excluded.last_format,
+                updated_at=excluded.updated_at
+            """,
+            (
+                user_id,
+                state.get("user_name") or "",
+                int(state.get("greeted") or 0),
+                state.get("last_intent") or "",
+                state.get("last_topic") or "",
+                state.get("last_format") or "",
+                now_iso(),
+            ),
+        )
+        conn.commit()
+
+
+def save_message(user_id: int, role: str, text: str) -> None:
+    text = (text or "").strip()
+    if not text:
+        return
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO messages (user_id, role, text, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, role, text[:4000], now_iso()),
+        )
+        # Keep the table small per user.
+        conn.execute(
+            """
+            DELETE FROM messages
+            WHERE user_id = ? AND id NOT IN (
+                SELECT id FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT 40
+            )
+            """,
+            (user_id, user_id),
+        )
+        conn.commit()
+
+
+def get_recent_messages(user_id: int, limit: int = MAX_MEMORY_MESSAGES) -> List[Dict[str, str]]:
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT role, text FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        )
+        rows = [dict(row) for row in cur.fetchall()]
+    rows.reverse()
+    return rows
+
+
+init_db()
+
+
+# -----------------------------
+# Text helpers
+# -----------------------------
+def clean_vk_text(text: str) -> str:
+    text = text or ""
+    text = re.sub(r"```.*?```", lambda m: m.group(0).replace("```", ""), text, flags=re.S)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"^\s*#{1,6}\s*", "", text, flags=re.M)
+    text = text.replace("###", "").replace("##", "").replace("**", "")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def norm(text: str) -> str:
+    return (text or "").lower().replace("ё", "е").strip()
+
+
+def first_name_part(name: Optional[str]) -> str:
+    name = (name or "").strip()
+    if not name:
+        return ""
+    return name.split()[0]
+
+
+def maybe_name(user_name: Optional[str]) -> str:
+    name = first_name_part(user_name)
+    if not name:
+        return ""
+    # Do not overuse the name.
+    return f"{name}, " if random.random() < 0.45 else ""
+
+
+def is_short_greeting(text: str) -> bool:
+    t = norm(text)
+    return t in {"привет", "здравствуй", "здравствуйте", "добрый день", "доброе утро", "добрый вечер", "хай", "ку", "hello", "hi"}
+
+
+def count_requested(text: str, default: int = 5, min_count: int = 1, max_count: int = 20) -> int:
+    m = re.search(r"\b(\d{1,2})\b", text or "")
+    if not m:
+        return default
+    return max(min_count, min(max_count, int(m.group(1))))
+
+
+def extract_topic_after_markers(text: str) -> str:
+    raw = (text or "").strip()
+    t = norm(raw)
+
+    patterns = [
+        r"(?:расклад|подсказк[ауи]?|совет|карту|карта|таро)\s+(?:на|по|про|о|об|для|насчет|по поводу)\s+(.+)",
+        r"(?:сделай|дай|посмотри|вытащи|вытяни|хочу|нужен|нужна)\s+(?:мне\s+)?(?:расклад|подсказк[ауи]?|совет|карту|таро)\s*(?:на|по|про|о|об|для|насчет|по поводу)?\s*(.+)",
+        r"(?:что\s+(?:меня|мне)\s+ждет|что\s+будет)\s+(.+)",
+        r"(?:стоит\s+ли|нужно\s+ли|можно\s+ли)\s+(.+)",
+        r"(?:по поводу)\s+(.+)",
+    ]
+    for p in patterns:
+        m = re.search(p, t, flags=re.I)
+        if m:
+            topic = m.group(1).strip(" .?!,:;—-")
+            topic = re.sub(r"^(сейчас|сегодня|пожалуйста|плиз|мне|я)\s+", "", topic).strip()
+            if topic and topic not in {"расклад", "таро", "карту", "карта", "совет", "подсказку"}:
+                return topic[:180]
+
+    # Clean command words and use the rest as topic if it still looks meaningful.
+    cleaned = re.sub(
+        r"\b(сделай|дай|посмотри|вытяни|вытащи|хочу|нужен|нужна|мне|пожалуйста|плиз|расклад|таро|карту|карта|совет|подсказку|подсказка|на|по|про|о|об|для)\b",
+        " ",
+        t,
+        flags=re.I,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .?!,:;—-")
+    if len(cleaned) >= 4:
+        return cleaned[:180]
+    return ""
+
+
+# -----------------------------
+# Full Tarot deck
+# -----------------------------
+MAJOR_ARCANA: Dict[str, str] = {
+    "Шут": "новое начало, свобода, доверие пути, свежий взгляд",
+    "Маг": "воля, действие, личная сила, умение пользоваться ресурсами",
+    "Жрица": "интуиция, тишина, скрытая информация, внутреннее знание",
+    "Императрица": "рост, забота, плодородие, телесность, красота",
+    "Император": "структура, границы, ответственность, порядок",
+    "Иерофант": "традиции, обучение, наставник, правила, вера",
+    "Влюблённые": "выбор, отношения, ценности, притяжение",
+    "Колесница": "движение, контроль, победа, решимость",
+    "Сила": "мягкая мощь, терпение, самообладание, смелость",
+    "Отшельник": "пауза, внутренний поиск, мудрость, дистанция",
+    "Колесо Фортуны": "поворот, цикл, шанс, перемены",
+    "Справедливость": "честность, баланс, последствия, ясное решение",
+    "Повешенный": "переоценка, пауза, другой взгляд, отпускание контроля",
+    "Смерть": "завершение, трансформация, обновление, переход",
+    "Умеренность": "гармония, исцеление, спокойный ритм, настройка баланса",
+    "Дьявол": "привязанности, искушения, зависимость, тени желания",
+    "Башня": "резкое очищение, разрушение старого, правда, освобождение",
+    "Звезда": "надежда, вдохновение, мягкое восстановление, вера в путь",
+    "Луна": "сомнения, тревоги, тайное, интуиция, неопределённость",
+    "Солнце": "радость, ясность, успех, энергия, открытость",
+    "Суд": "пробуждение, важный вывод, зов, новый этап",
+    "Мир": "завершение, цельность, результат, переход на новый уровень",
+}
+
+SUIT_BASE = {
+    "Жезлов": "действие, энергия, инициативу, амбиции, движение",
+    "Кубков": "чувства, отношения, эмоциональный фон, близость",
+    "Мечей": "мысли, решения, конфликты, честность, анализ",
+    "Пентаклей": "деньги, работа, тело, быт, стабильность, практику",
+}
+
+RANK_MEANINGS = {
+    "Туз": "новый импульс и зарождение возможности",
+    "Двойка": "выбор, баланс и необходимость сверить направление",
+    "Тройка": "рост, первые результаты и расширение",
+    "Четвёрка": "опора, пауза, стабильность и фиксация",
+    "Пятёрка": "напряжение, вызов и точка пересборки",
+    "Шестёрка": "движение к облегчению, поддержка и восстановление",
+    "Семёрка": "проверка, защита позиции и внутренняя стойкость",
+    "Восьмёрка": "динамика, работа процесса и быстрые изменения",
+    "Девятка": "личный итог, зрелость и приближение результата",
+    "Десятка": "завершение цикла, нагрузка или полнота опыта",
+    "Паж": "новость, проба, ученичество и первый шаг",
+    "Рыцарь": "активное движение, напор и развитие события",
+    "Королева": "зрелое принятие, забота и внутренняя устойчивость",
+    "Король": "управление, ответственность и уверенное владение темой",
+}
+
+
+def build_minor_arcana() -> Dict[str, str]:
+    deck = {}
+    ranks = [
+        "Туз", "Двойка", "Тройка", "Четвёрка", "Пятёрка", "Шестёрка", "Семёрка",
+        "Восьмёрка", "Девятка", "Десятка", "Паж", "Рыцарь", "Королева", "Король",
+    ]
+    for suit, base in SUIT_BASE.items():
+        for rank in ranks:
+            deck[f"{rank} {suit}"] = f"{RANK_MEANINGS[rank]}; сфера карты — {base}"
+    return deck
+
+
+TAROT_MEANINGS: Dict[str, str] = {**MAJOR_ARCANA, **build_minor_arcana()}
+TAROT_CARDS: List[str] = list(TAROT_MEANINGS.keys())
+
+
+def draw_cards(count: int) -> List[str]:
+    return random.sample(TAROT_CARDS, min(count, len(TAROT_CARDS)))
+
+
+def tarot_card_description(card: str) -> str:
+    meaning = TAROT_MEANINGS.get(card, "интуитивная подсказка, которую важно прочитать мягко и честно")
+    return f"{card} — {meaning}."
+
+
+# -----------------------------
+# VK API helpers
+# -----------------------------
+def vk_api(method: str, params: Dict) -> Dict:
+    if not VK_GROUP_TOKEN:
+        return {"error": {"error_msg": "VK_GROUP_TOKEN is empty"}}
+    payload = dict(params)
+    payload["access_token"] = VK_GROUP_TOKEN
+    payload["v"] = VK_API_VERSION
+    try:
+        r = requests.post(f"https://api.vk.com/method/{method}", data=payload, timeout=15)
+        return r.json()
+    except Exception as e:
+        return {"error": {"error_msg": str(e)}}
+
+
+def vk_send_message(user_id: int, text: str) -> None:
+    text = clean_vk_text(text)
+    if not text:
+        text = "Я рядом. Напиши мне ещё раз чуть подробнее."
+    data = vk_api(
+        "messages.send",
+        {
+            "user_id": user_id,
+            "message": text[:3900],
+            "random_id": random.randint(1, 2_000_000_000),
+        },
+    )
+    if "error" in data:
+        print(f"VK_SEND_ERROR user_id={user_id} error={data['error']}", flush=True)
+
+
+def vk_get_user_name(user_id: int) -> str:
+    data = vk_api("users.get", {"user_ids": user_id, "fields": "first_name"})
+    try:
+        user = data.get("response", [{}])[0]
+        return (user.get("first_name") or "").strip()
+    except Exception:
+        return ""
+
+
+def vk_is_member(user_id: int) -> bool:
+    if not VK_MEMBERS_ONLY:
+        return True
+    data = vk_api("groups.isMember", {"group_id": VK_GROUP_ID, "user_id": user_id})
+    if "error" in data:
+        print(f"VK_MEMBER_ERROR user_id={user_id} error={data['error']}", flush=True)
+        # If VK check fails, do not block a real user by accident.
+        return True
+    return str(data.get("response")) in {"1", "true", "True"}
+
+
+# -----------------------------
+# Intent detection
+# -----------------------------
+def wants_capabilities(text: str) -> bool:
+    t = norm(text)
+    exact = {
+        "что ты умеешь", "помощь", "команды", "меню", "start", "/start", "начать", "возможности",
+        "как с тобой работать", "что можешь", "что ты можешь",
+    }
+    return t in exact
+
+
+def wants_affirmations(text: str) -> bool:
+    t = norm(text)
+    return any(x in t for x in ["аффирмац", "утверждени", "позитивные фразы"])
+
+
+def wants_motivation(text: str) -> bool:
+    t = norm(text)
+    return any(x in t for x in ["мотивац", "мотивируй", "настрой на день", "настрой на неделю", "вдохнови", "сил на"])
+
+
+def wants_support(text: str) -> bool:
+    t = norm(text)
+    support_words = [
+        "тяжело", "плохо", "грустно", "страшно", "тревожно", "устала", "устал", "выгорел",
+        "выгорела", "не могу", "не получается", "нет сил", "поддержи", "хочу поговорить",
+        "сомневаюсь", "переживаю", "паника", "одиноко", "не знаю что делать", "опустились руки",
+    ]
+    return any(x in t for x in support_words)
+
+
+def wants_tarot(text: str, state: Optional[Dict] = None) -> bool:
+    t = norm(text)
+
+    # Важно: не уводим в Таро по обычным жизненным вопросам вроде
+    # "стоит ли менять работу", "что будет с отпуском", "я переживаю за переезд".
+    # Таро включается только когда человек явно просит карты/расклад/гадание
+    # или продолжает уже начатый Таро-сценарий.
+    explicit_tarot_markers = [
+        "таро",
+        "расклад",
+        "карт",      # карта, карты, картам, картами
+        "аркан",
+        "колод",
+        "погада",
+        "гадани",
+        "вытяни",
+        "вытащи",
+        "достань карту",
+        "узнать у карт",
+        "посмотри по картам",
+        "совет карт",
+        "подсказка карт",
+        "энергия недели",
+        "энергия месяца",
+    ]
+    if any(x in t for x in explicit_tarot_markers):
+        return True
+
+    if state and (state.get("last_intent") or "").startswith("tarot"):
+        # Короткое подтверждение после предложения Таро: "да", "давай", "сделай".
+        if t in {"да", "давай", "хочу", "можно", "конечно", "ага", "ок", "окей", "подскажи", "сделай"}:
+            return True
+
+    return False
+
+
+def is_plain_tarot_menu_request(text: str) -> bool:
+    t = norm(text)
+    return t in {"таро", "расклад", "карты", "карту", "хочу таро", "давай таро", "сделай расклад"}
+
+
+# -----------------------------
+# Bot answers
+# -----------------------------
+def capabilities_answer(user_name: Optional[str] = None, compact: bool = False) -> str:
+    prefix = maybe_name(user_name)
+    if compact:
+        return (
+            f"{prefix}я на связи. Можешь написать живыми словами: нужна карта дня, расклад на ситуацию, "
+            "аффирмации, мотивация или мягкая поддержка."
+        )
+    return (
+        f"{prefix}я могу помочь в нескольких форматах:\n\n"
+        "🃏 карта дня;\n"
+        "🌙 подсказка на неделю;\n"
+        "🔮 расклад на ситуацию из 3 карт;\n"
+        "❓ расклад на вопрос;\n"
+        "💬 мягкая поддержка;\n"
+        "✨ аффирмации;\n"
+        "🔥 мотивация и настрой.\n\n"
+        "Напиши обычными словами, например: “сделай расклад на смену работы” или “дай 7 аффирмаций на любовь”."
+    )
+
+
+def tarot_menu(user_name: Optional[str] = None) -> str:
+    prefix = maybe_name(user_name)
+    return (
+        f"{prefix}могу сделать Таро-подсказку в нескольких форматах:\n\n"
+        "🃏 карта дня;\n"
+        "🌙 подсказка на неделю;\n"
+        "🔮 расклад на ситуацию из 3 карт;\n"
+        "❓ расклад на вопрос;\n"
+        "📅 энергия месяца;\n"
+        "💡 совет карт.\n\n"
+        "Напиши формат и тему. Например: “расклад на смену работы” или “что меня ждёт в отношениях”."
+    )
+
+
+def tarot_single_answer(format_name: str, user_text: str, intro: str = "") -> str:
+    card = draw_cards(1)[0]
+    topic = extract_topic_after_markers(user_text)
+    topic_line = f"Тема: {topic}.\n\n" if topic else ""
+    return (
+        f"{intro}\n" if intro else ""
+    ) + (
+        f"{format_name}\n"
+        f"{topic_line}"
+        f"Вытянутая карта: {card}.\n\n"
+        f"{tarot_card_description(card)}\n\n"
+        "Бережный совет: прислушайся к тому, где внутри появляется спокойное “да”, а где тело сжимается. "
+        "Карта не приговор, а символическая подсказка — решение всё равно остаётся в твоих руках."
+    )
+
+
+def tarot_three_cards_answer(format_name: str, user_text: str, positions: Optional[List[str]] = None) -> str:
+    topic = extract_topic_after_markers(user_text)
+    if not topic:
+        topic = "текущая ситуация"
+    cards = draw_cards(3)
+    positions = positions or ["что влияет на ситуацию", "что может открыться дальше", "совет карты"]
+    lines = [
+        f"{format_name}",
+        f"Тема: {topic}.",
+        "",
+    ]
+    for i, (pos, card) in enumerate(zip(positions, cards), start=1):
+        lines.append(f"{i}. {pos.capitalize()} — {card}.")
+        lines.append(tarot_card_description(card))
+        lines.append(interpret_card_for_topic(card, topic, pos))
+        lines.append("")
+    lines.append(
+        "Итог: воспринимай расклад как мягкую навигацию, а не как приговор. "
+        "Он помогает увидеть настроение ситуации и возможные точки внимания."
+    )
+    return "\n".join(lines).strip()
+
+
+def interpret_card_for_topic(card: str, topic: str, position: str) -> str:
+    meaning = TAROT_MEANINGS.get(card, "символическая подсказка")
+    prompt = (
+        f"Карта: {card}. Значение: {meaning}. Тема пользователя: {topic}. "
+        f"Позиция в раскладе: {position}. Дай 2-3 предложения мягкой интерпретации на русском. "
+        "Без Markdown, без заголовков, без категоричных предсказаний."
+    )
+    answer = openrouter_simple(prompt, max_tokens=240)
+    if answer:
+        return clean_vk_text(answer)
+    return f"В этой позиции карта мягко указывает на тему: {meaning}. Важно не спешить и свериться с реальными обстоятельствами."
+
+
+def handle_tarot(user_id: int, user_text: str, user_name: Optional[str] = None) -> str:
+    state = get_user_state(user_id)
+    t = norm(user_text)
+
+    # Continuation: user says yes after previous tarot offer/menu.
+    if t in {"да", "давай", "хочу", "можно", "конечно", "ага", "ок", "окей", "подскажи", "сделай"}:
+        last_topic = state.get("last_topic") or "текущая ситуация"
+        update_user_state(user_id, last_intent="tarot_spread", last_topic=last_topic, last_format="3_cards")
+        return tarot_three_cards_answer("Давай посмотрим это через расклад из 3 карт.", f"расклад на {last_topic}")
+
+    if is_plain_tarot_menu_request(user_text):
+        update_user_state(user_id, last_intent="tarot_menu", last_topic="", last_format="")
+        return tarot_menu(user_name)
+
+    topic = extract_topic_after_markers(user_text)
+
+    if "недел" in t:
+        update_user_state(user_id, last_intent="tarot_week", last_topic=topic or "неделя", last_format="week")
+        return tarot_three_cards_answer(
+            "Подсказка на неделю",
+            user_text,
+            ["главная энергия недели", "что может поддержать", "бережный совет"],
+        )
+
+    if "месяц" in t or "месяц" in topic:
+        update_user_state(user_id, last_intent="tarot_month", last_topic=topic or "месяц", last_format="month")
+        return tarot_three_cards_answer(
+            "Энергия месяца",
+            user_text,
+            ["главная энергия месяца", "зона роста", "совет на месяц"],
+        )
+
+    if "карта дня" in t or ("карт" in t and "дня" in t):
+        update_user_state(user_id, last_intent="tarot_day", last_topic="день", last_format="single")
+        return tarot_single_answer("Карта дня", user_text, intro="Посмотрим мягкую подсказку на сегодня ✨")
+
+    # If they ask for a spread with a real topic, do it, not menu.
+    if "расклад" in t or topic:
+        update_user_state(user_id, last_intent="tarot_spread", last_topic=topic or "текущая ситуация", last_format="3_cards")
+        return tarot_three_cards_answer(
+            "Расклад из 3 карт",
+            user_text if topic else "расклад на текущую ситуацию",
+            ["что сейчас влияет", "что может открыться дальше", "совет карт"],
+        )
+
+    update_user_state(user_id, last_intent="tarot_menu", last_topic="", last_format="")
+    return tarot_menu(user_name)
+
+
+def affirmation_topic(text: str) -> str:
+    t = norm(text)
+    m = re.search(r"(?:аффирмац\w*|утверждени\w*)\s+(?:на|для|про|о|об)\s+(.+)", t)
+    if m:
+        return m.group(1).strip(" .?!,:;—-")[:80]
+    m = re.search(r"(?:на|для|про|о|об)\s+([а-яa-z\s-]{3,80})", t)
+    if m:
+        return m.group(1).strip(" .?!,:;—-")[:80]
+    return "день"
+
+
+def handle_affirmations(user_id: int, user_text: str, user_name: Optional[str] = None) -> str:
+    count = count_requested(user_text, default=5, max_count=15)
+    topic = affirmation_topic(user_text)
+    update_user_state(user_id, last_intent="affirmations", last_topic=topic, last_format=str(count))
+
+    prompt = (
+        f"Составь {count} коротких, тёплых аффирмаций на тему: {topic}. "
+        "Русский язык. Без Markdown. Нумерованный список. Без эзотерического давления, мягко и бережно."
+    )
+    ai = openrouter_simple(prompt, max_tokens=600)
+    if ai:
+        return clean_vk_text(f"Аффирмации на тему «{topic}»:\n\n{ai}")
+
+    base = [
+        f"Я разрешаю себе двигаться в теме «{topic}» спокойно и бережно.",
+        "Я выбираю поддерживать себя, а не давить на себя.",
+        "Я могу делать маленькие шаги и всё равно идти вперёд.",
+        "Я замечаю свои чувства и отношусь к ним с уважением.",
+        "Я достоин/достойна мягкости, любви и внутренней опоры.",
+        "Я открываюсь хорошему в своём темпе.",
+        "Я доверяю себе и своему пути.",
+        "Я выбираю спокойствие там, где раньше выбирал/выбирала тревогу.",
+        "Моя энергия возвращается ко мне мягко и естественно.",
+        "Сегодня я могу быть на своей стороне.",
+    ]
+    return "Аффирмации:\n\n" + "\n".join(f"{i}. {x}" for i, x in enumerate(base[:count], 1))
+
+
+def handle_motivation(user_id: int, user_text: str, user_name: Optional[str] = None) -> str:
+    topic = extract_topic_after_markers(user_text) or "сегодняшний день"
+    update_user_state(user_id, last_intent="motivation", last_topic=topic, last_format="")
+    prompt = (
+        f"Дай короткую тёплую мотивацию на тему: {topic}. "
+        "Тон: бережный, живой, без токсичной продуктивности. 5-7 предложений. Без Markdown."
+    )
+    ai = openrouter_simple(prompt, max_tokens=500)
+    if ai:
+        return clean_vk_text(ai)
+    return (
+        "Не всё сразу. Один спокойный шаг уже считается. "
+        "Сегодня не нужно побеждать весь мир — достаточно выбрать одно действие, которое вернёт тебе ощущение опоры."
+    )
+
+
+def handle_support(user_id: int, user_text: str, user_name: Optional[str] = None) -> str:
+    update_user_state(user_id, last_intent="support", last_topic="", last_format="")
+    name = first_name_part(user_name)
+    context = build_memory_context(user_id)
+    prompt = (
+        "Ты — тёплый AI-помощник сообщества Зайка-чудодей. "
+        "Пользователь пишет, что ему тяжело или нужна поддержка. "
+        "Ответь бережно, по-человечески, без медицинских диагнозов и без давления. "
+        "Не выдавай меню. Можешь задать один мягкий уточняющий вопрос в конце. "
+        "Без Markdown.\n"
+        f"Имя пользователя: {name or 'неизвестно'}.\n"
+        f"Контекст последних сообщений:\n{context}\n"
+        f"Сообщение пользователя: {user_text}"
+    )
+    ai = openrouter_simple(prompt, max_tokens=650)
+    if ai:
+        return clean_vk_text(ai)
+    return (
+        f"{maybe_name(user_name)}я рядом. Похоже, сейчас правда непросто. "
+        "Давай не будем требовать от себя сразу больших решений. Сделай один маленький шаг: выдохни, назови, что именно давит сильнее всего, и напиши мне."
+    )
+
+
+# -----------------------------
+# OpenRouter
+# -----------------------------
+def openrouter_simple(prompt: str, max_tokens: int = 700) -> str:
+    if not OPENROUTER_API_KEY:
+        return ""
+    try:
+        r = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://vk.com/",
+                "X-Title": "Zaika Chudodey",
+            },
+            json={
+                "model": OPENROUTER_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.75,
+                "max_tokens": max_tokens,
+            },
+            timeout=45,
+        )
+        data = r.json()
+        if "error" in data:
+            print(f"OPENROUTER_ERROR {data['error']}", flush=True)
+            return ""
+        return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    except Exception as e:
+        print(f"OPENROUTER_EXCEPTION {e}", flush=True)
+        return ""
+
+
+def build_memory_context(user_id: int) -> str:
+    rows = get_recent_messages(user_id, limit=10)
+    if not rows:
+        return "пока нет"
+    lines = []
+    for row in rows:
+        role = "Пользователь" if row["role"] == "user" else "Бот"
+        lines.append(f"{role}: {row['text'][:500]}")
+    return "\n".join(lines[-10:])
+
+
+def soft_dialogue_fallback(user_text: str, user_name: Optional[str] = None) -> str:
+    """Живой запасной ответ, если AI временно недоступен.
+    Не уводит в Таро без явной просьбы, но может мягко предложить карты как вариант.
+    """
+    text = norm(user_text)
+    name = maybe_name(user_name)
+
+    decision_markers = (
+        "стоит ли", "нужно ли", "надо ли", "как быть", "что делать",
+        "не знаю", "сомнева", "выбор", "выбрать", "решиться",
+        "менять", "смен", "уходить", "уволь", "переезд", "ехать", "поезд",
+        "отнош", "работ", "деньг", "покуп", "продаж", "дом", "квартир"
+    )
+
+    if any(m in text for m in decision_markers):
+        return (
+            f"{name}это решение всё равно должно остаться за тобой — я не хочу решать вместо тебя. "
+            "Но могу помочь спокойно на него посмотреть. Попробуй прислушаться: от какого варианта внутри становится чуть свободнее, "
+            "а от какого — тяжелее и теснее?\n\n"
+            "Можно начать с трёх простых вопросов:\n"
+            "1. Что я получу, если сделаю этот шаг?\n"
+            "2. Что я потеряю, если останусь как есть?\n"
+            "3. Чего я на самом деле боюсь в этом решении?\n\n"
+            "Если хочешь, можем отдельно посмотреть это через карты: например, сделать расклад из 3 карт — что держит, что открывается дальше и какой совет."
+        )
+
+    return (
+        f"{name}я рядом. Расскажи чуть подробнее, что именно происходит и какой вопрос сейчас самый главный. "
+        "Я помогу спокойно разобрать ситуацию. Если захочешь, отдельно можем посмотреть её через карты."
+    )
+
+
+def general_openrouter_answer(user_id: int, user_text: str, user_name: Optional[str] = None) -> str:
+    name = first_name_part(user_name)
+    context = build_memory_context(user_id)
+    prompt = (
+        f"Ты — {BOT_NAME}, тёплый AI-помощник эзотерико-психологического сообщества. "
+        "Отвечай живо, мягко и понятно. Не используй Markdown, решётки, жирный шрифт и кодовые блоки. "
+        "Не начинай каждый ответ с приветствия. Не показывай меню без прямой просьбы. "
+        "Если пользователь продолжает прошлую мысль, учитывай контекст. "
+        "Если пользователь НЕ просит явно карты, Таро, расклад или гадание, не уводи ответ в Таро. "
+        "На жизненные вопросы вроде 'стоит ли менять работу' отвечай как мягкий собеседник: решение остаётся за человеком, помоги посмотреть на чувства, риски и варианты. "
+        "В конце можно коротко предложить: если хочешь, можем отдельно посмотреть через карты. "
+        "Не давай медицинские, юридические или финансовые гарантии.\n"
+        f"Имя пользователя: {name or 'неизвестно'}. Иногда можешь обратиться по имени, но не часто.\n"
+        f"Контекст последних сообщений:\n{context}\n"
+        f"Новое сообщение пользователя: {user_text}"
+    )
+    ai = openrouter_simple(prompt, max_tokens=800)
+    if ai:
+        return clean_vk_text(ai)
+    return soft_dialogue_fallback(user_text, user_name)
+
+
+# -----------------------------
+# Router
+# -----------------------------
+def build_answer(user_id: int, user_text: str, user_name: Optional[str] = None) -> str:
+    user_text = (user_text or "").strip()
+    if not user_text:
+        return capabilities_answer(user_name, compact=True)
+
+    state = get_user_state(user_id)
+    if user_name:
+        update_user_state(user_id, user_name=user_name)
+
+    save_message(user_id, "user", user_text)
+
+    try:
+        if is_short_greeting(user_text):
+            if state.get("greeted"):
+                answer = capabilities_answer(user_name, compact=True)
+            else:
+                update_user_state(user_id, greeted=1, last_intent="greeting")
+                answer = capabilities_answer(user_name)
+        elif wants_capabilities(user_text):
+            update_user_state(user_id, greeted=1, last_intent="capabilities")
+            answer = capabilities_answer(user_name)
+        elif wants_affirmations(user_text):
+            answer = handle_affirmations(user_id, user_text, user_name)
+        elif wants_tarot(user_text, state):
+            answer = handle_tarot(user_id, user_text, user_name)
+        elif wants_motivation(user_text):
+            answer = handle_motivation(user_id, user_text, user_name)
+        elif wants_support(user_text):
+            answer = handle_support(user_id, user_text, user_name)
+        else:
+            # Если пользователь только что выбрал Таро-меню, следующую тему можно принять
+            # как тему расклада. В остальных случаях обычные жизненные фразы не уводим в Таро.
+            last_intent = state.get("last_intent") or ""
+            if last_intent in {"tarot_menu", "tarot_offer"} and len(user_text) > 3:
+                answer = handle_tarot(user_id, f"расклад на {user_text}", user_name)
+            else:
+                update_user_state(user_id, last_intent="dialogue")
+                answer = general_openrouter_answer(user_id, user_text, user_name)
+    except Exception as e:
+        print(f"BUILD_ANSWER_ERROR user_id={user_id} error={e}", flush=True)
+        answer = "Я рядом, но сейчас чуть споткнулся внутри. Напиши мне ещё раз — лучше чуть проще и конкретнее."
+
+    answer = clean_vk_text(answer)
+    save_message(user_id, "assistant", answer)
+    return answer
+
+
+# -----------------------------
+# VK Callback
+# -----------------------------
 @app.route("/callback", methods=["POST"])
 def callback():
     data = request.get_json(force=True, silent=True)
-
     if not data:
         return "ok"
 
     if VK_SECRET_KEY and not VK_SECRET_KEY.startswith("сюда_потом"):
         incoming_secret = data.get("secret")
         if incoming_secret != VK_SECRET_KEY:
+            print("VK_BAD_SECRET", flush=True)
             return "ok"
 
     event_type = data.get("type")
 
     if event_type == "confirmation":
-        if not is_placeholder(VK_CONFIRMATION_TOKEN):
-            return VK_CONFIRMATION_TOKEN
-        return "c9c78fbe"
+        return VK_CONFIRMATION_TOKEN or "c9c78fbe"
 
     if event_type == "message_new":
         message = data.get("object", {}).get("message", {})
-        user_id = message.get("from_id")
-        user_text = message.get("text", "")
-
+        user_id = int(message.get("from_id") or 0)
+        user_text = message.get("text", "") or ""
         print(f"VK_INCOMING from_id={user_id} text={user_text}", flush=True)
 
-        if user_id and user_text:
-            group_id = get_callback_group_id(data)
+        if user_id <= 0:
+            return "ok"
 
-            if not vk_is_group_member(user_id, group_id):
-                answer = membership_required_answer()
-            else:
-                user_name = vk_get_user_name(user_id)
-                answer = build_answer(user_id, user_text, user_name=user_name)
+        user_name = vk_get_user_name(user_id)
+        if user_name:
+            update_user_state(user_id, user_name=user_name)
 
-            answer = clean_vk_text(answer)
-            vk_send_message(user_id, answer)
+        if VK_MEMBERS_ONLY and not vk_is_member(user_id):
+            name_part = first_name_part(user_name)
+            prefix = f"{name_part}, " if name_part else ""
+            vk_send_message(
+                user_id,
+                prefix + "я отвечаю только подписчикам сообщества. Подпишись на группу, а потом напиши мне ещё раз — и я с радостью продолжу ✨",
+            )
+            return "ok"
 
+        answer = build_answer(user_id, user_text, user_name=user_name)
+        vk_send_message(user_id, answer)
         return "ok"
 
     return "ok"
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
+    port = int(os.getenv("PORT", "5000") or "5000")
     app.run(host="0.0.0.0", port=port)
