@@ -994,7 +994,7 @@ def openrouter_request_messages(messages: List[Dict[str, str]], max_tokens: int 
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
                 "HTTP-Referer": "https://vk.com/",
-                "X-Title": BOT_NAME,
+                "X-Title": "Zaika Chudodey VK Bot",
             },
             json={
                 "model": OPENROUTER_MODEL,
