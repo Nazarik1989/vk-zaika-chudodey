@@ -158,15 +158,15 @@ def save_message(user_id: int, role: str, text: str) -> None:
 def make_vk_event_key(data: Dict, message: Dict) -> str:
     """Stable key for VK Callback retries. VK may resend the same message_new event if
     our server answers too slowly, so we must not reply twice to the same event.
+    Do not rely only on event_id: for retries/platform quirks it can be unstable.
     """
     group_id = str(data.get("group_id") or "")
-    event_id = str(data.get("event_id") or "")
     peer_id = str(message.get("peer_id") or message.get("from_id") or "")
     message_id = str(message.get("id") or "")
     conversation_message_id = str(message.get("conversation_message_id") or "")
     date = str(message.get("date") or "")
     text_hash = hashlib.sha1((message.get("text") or "").encode("utf-8", "ignore")).hexdigest()
-    raw = "|".join([group_id, event_id, peer_id, message_id, conversation_message_id, date, text_hash])
+    raw = "|".join([group_id, peer_id, message_id, conversation_message_id, date, text_hash])
     return hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()
 
 
@@ -241,13 +241,190 @@ def maybe_name(user_name: Optional[str]) -> str:
     name = first_name_part(user_name)
     if not name:
         return ""
-    # Do not overuse the name.
-    return f"{name}, " if random.random() < 0.45 else ""
+    # Name should sound warm, not repetitive.
+    return f"{name}, " if random.random() < 0.12 else ""
 
 
 def is_short_greeting(text: str) -> bool:
     t = norm(text)
     return t in {"привет", "здравствуй", "здравствуйте", "добрый день", "доброе утро", "добрый вечер", "хай", "ку", "hello", "hi"}
+
+
+
+
+def is_tarot_continuation(text: str) -> bool:
+    t = norm(text)
+    return t in {
+        "давай по картам", "давай посмотрим по картам", "посмотри по картам", "можно по картам",
+        "хочу по картам", "давай карты", "давай расклад", "сделай расклад", "давай", "да", "хочу",
+        "ок", "окей", "ага", "можно", "конечно",
+    }
+
+
+def is_single_card_request(text: str) -> bool:
+    t = norm(text)
+    if "расклад" in t:
+        return False
+    if "карта дня" in t or ("карт" in t and "дня" in t):
+        return True
+    if "подсказ" in t and any(x in t for x in ["сегодня", "день", "сейчас"]):
+        return True
+    return any(x in t for x in ["вытяни карту", "вытащи карту", "достань карту", "одну карту", "1 карту"])
+
+
+def is_spread_request(text: str) -> bool:
+    t = norm(text)
+    return any(x in t for x in ["расклад", "посмотри по картам", "узнать у карт", "совет карт", "погада"])
+
+
+def single_card_topic(text: str) -> str:
+    t = norm(text)
+    m = re.search(r"(?:карту|карта|подсказк\w*)\s+(?:на|по|про|о|об|для)\s+(.+)", t)
+    if m:
+        topic = m.group(1).strip(" .?!,:;—-")
+        if topic:
+            return topic[:120]
+    return ""
+
+
+def extract_life_topic(text: str) -> str:
+    t = norm(text)
+    patterns = [
+        r"стоит\s+ли\s+(.+)",
+        r"нужно\s+ли\s+(.+)",
+        r"можно\s+ли\s+(.+)",
+        r"хочу\s+(.+)",
+        r"думаю\s+(?:о|об|про)?\s*(.+)",
+        r"переживаю\s+(?:за|из-за|насчет|про)?\s*(.+)",
+        r"боюсь\s+(.+)",
+    ]
+    for p in patterns:
+        m = re.search(p, t)
+        if m:
+            topic = m.group(1).strip(" .?!,:;—-")
+            topic = re.sub(r"^(что|как|если|мне|я|это)\s+", "", topic).strip()
+            if len(topic) >= 3:
+                return topic[:180]
+    return ""
+
+
+def is_date_only_request(text: str) -> bool:
+    t = norm(text)
+    t = re.sub(r"\s+", " ", t).strip(" .?!,:;—-")
+    months = "января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря"
+    if re.fullmatch(r"\d{1,2}[./-]\d{1,2}([./-]\d{2,4})?", t):
+        return True
+    if re.fullmatch(rf"\d{{1,2}}\s+({months})(\s+\d{{4}})?", t):
+        return True
+    if re.fullmatch(r"\d{4}", t):
+        return True
+    return False
+
+
+def is_ambiguous_request(text: str) -> bool:
+    t = norm(text)
+    if is_date_only_request(text):
+        return True
+    words = re.findall(r"[а-яa-z0-9]+", t)
+    if len(words) <= 1 and not any(x in t for x in ["таро", "карта", "расклад", "аффирма", "мотивац"]):
+        return True
+    if len(words) <= 2 and any(w in t for w in ["талисман", "дата", "число", "сон", "работа", "любовь", "переезд"]):
+        return True
+    return False
+
+
+def clarify_request(user_text: str, user_name: Optional[str] = None) -> str:
+    if is_date_only_request(user_text):
+        return (
+            "Поняла дату. А что именно хочешь посмотреть по ней?\n\n"
+            "Могу разобрать нумерологию даты, энергию дня, астрологический фон, подсказку по событию или сделать расклад по картам."
+        )
+    topic = (user_text or "это").strip() or "это"
+    return (
+        f"Поняла: {topic}. Уточни, пожалуйста, что именно хочешь узнать?\n\n"
+        "Могу дать мягкий совет, посмотреть символику, разобрать через нумерологию/астрологию или сделать расклад по картам."
+    )
+
+
+
+def soft_general_fallback(user_text: str) -> str:
+    t = norm(user_text)
+
+    if "нумеролог" in t or "энерг" in t and is_date_only_request(user_text):
+        months = {
+            "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+            "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+        }
+        nums = re.findall(r"\d+", t)
+        month_num = ""
+        for m_name, m_num in months.items():
+            if m_name in t:
+                month_num = str(m_num)
+                break
+        digits_source = "".join(nums) + month_num
+        digits = [int(ch) for ch in digits_source if ch.isdigit()]
+        if digits:
+            total = sum(digits)
+            root = total
+            while root > 9:
+                root = sum(int(ch) for ch in str(root))
+            meanings = {
+                1: "начало, самостоятельность, первый шаг и личное решение",
+                2: "партнёрство, чувствительность, баланс и умение слышать себя",
+                3: "творчество, проявленность, общение и лёгкость",
+                4: "структура, опора, порядок и практичные шаги",
+                5: "перемены, движение, свобода и выход из привычного",
+                6: "забота, отношения, красота и выбор сердцем",
+                7: "внутренний поиск, интуиция, анализ и тишина",
+                8: "сила, деньги, ответственность и управление ресурсами",
+                9: "завершение, мудрость, отпускание и широкий взгляд",
+            }
+            return (
+                f"Если смотреть это мягко через простую нумерологическую сумму, получается число {root}.\n\n"
+                f"Энергия числа {root} — {meanings.get(root, 'символическая подсказка для размышления')}. "
+                "Это не приговор и не точный прогноз, а скорее настроение даты. Его можно использовать как подсказку: что поддержать в себе, на что обратить внимание и какой шаг сделать осознаннее."
+            )
+
+    if "код изобилия" in t:
+        return (
+            "Могу помочь с кодом изобилия, но уточни, пожалуйста, по какой системе считать. "
+            "Если ориентируемся на дату рождения, пришли дату полностью — день, месяц и год. Тогда я мягко разберу число и дам подсказку."
+        )
+
+    if "талисман" in t and any(x in t for x in ["имя", "назв", "как назвать", "выбрать"]):
+        return (
+            "Для талисмана лучше выбирать имя не только по красоте, но и по ощущению: чтобы оно звучало как опора, защита или намерение.\n\n"
+            "Можно рассмотреть такие варианты:\n"
+            "1. Луми — про свет и мягкое ведение.\n"
+            "2. Аура — про защитное поле и внутреннее сияние.\n"
+            "3. Мира — про спокойствие, лад и гармонию.\n"
+            "4. Сея — про рост, намерение и посеянное желание.\n"
+            "5. Веста — про домашний огонь, защиту и внутреннюю силу.\n\n"
+            "А если хочешь точнее, напиши, для чего талисман: любовь, деньги, защита, уверенность, дорога или раскрытие женской энергии."
+        )
+
+    if "астролог" in t or "наталь" in t or "асценд" in t or "гороскоп" in t:
+        return (
+            "Могу посмотреть это в мягком астрологическом ключе. Для точного разбора нужны дата рождения, точное время и город рождения. "
+            "Если точных данных нет, я могу дать общий символический фон без претензии на профессиональный расчёт."
+        )
+
+    topic = extract_life_topic(user_text)
+    if topic:
+        return (
+            "Это решение всё равно должно остаться за тобой — я не хочу решать вместо тебя. "
+            "Но могу помочь спокойно на него посмотреть. Попробуй прислушаться: от какого варианта внутри становится чуть свободнее, а от какого — тяжелее и теснее?\n\n"
+            "Можно начать с трёх вопросов:\n"
+            "1. Что я получу, если сделаю этот шаг?\n"
+            "2. Что я потеряю, если оставлю всё как есть?\n"
+            "3. Чего я на самом деле боюсь в этом решении?\n\n"
+            "Если хочешь, можем отдельно посмотреть это через карты: например, сделать расклад из 3 карт — что держит, что открывается дальше и какой совет."
+        )
+    return (
+        "Я рядом. Могу ответить мягко и по смыслу, но сейчас мне нужно чуть больше контекста. "
+        "Напиши вопрос чуть подробнее — что именно хочешь понять или почувствовать в этой ситуации?"
+    )
+
 
 
 def count_requested(text: str, default: int = 5, min_count: int = 1, max_count: int = 20) -> int:
@@ -453,44 +630,48 @@ def wants_support(text: str) -> bool:
 
 def wants_tarot(text: str, state: Optional[Dict] = None) -> bool:
     t = norm(text)
-    tarot_words = [
+    explicit_markers = [
         "таро", "расклад", "карт", "аркан", "погада", "вытяни", "вытащи",
-        "что меня ждет", "что мне ждать", "что будет", "энергия недели", "энергия месяца",
-        "стоит ли", "узнать у карт", "посмотри по картам", "подсказка на неделю",
+        "узнать у карт", "посмотри по картам", "совет карт", "подсказка на неделю",
+        "энергия недели", "энергия месяца", "карта дня", "карты скажут",
     ]
-    if any(x in t for x in tarot_words):
+    if any(x in t for x in explicit_markers):
         return True
-    if state and (state.get("last_intent") or "").startswith("tarot"):
-        if t in {"да", "давай", "хочу", "можно", "конечно", "ага", "ок", "окей", "подскажи", "сделай"}:
-            return True
+    if is_single_card_request(text):
+        return True
+    if is_tarot_continuation(text) and state and (state.get("last_topic") or ""):
+        return True
     return False
 
 
 def is_plain_tarot_menu_request(text: str) -> bool:
     t = norm(text)
-    return t in {"таро", "расклад", "карты", "карту", "хочу таро", "давай таро", "сделай расклад"}
+    return t in {"таро", "карты", "хочу таро", "давай таро", "что по таро", "погадай"}
 
 
 # -----------------------------
 # Bot answers
 # -----------------------------
 def capabilities_answer(user_name: Optional[str] = None, compact: bool = False) -> str:
-    prefix = maybe_name(user_name)
+    name = first_name_part(user_name)
     if compact:
         return (
-            f"{prefix}я на связи. Можешь написать живыми словами: нужна карта дня, расклад на ситуацию, "
-            "аффирмации, мотивация или мягкая поддержка."
+            "Я на связи. Можешь написать живыми словами: нужна карта дня, расклад на ситуацию, "
+            "аффирмации, мотивация, мягкая поддержка, нумерология или астрологическая подсказка."
         )
+    greeting = f"Привет, {name}!" if name else "Привет!"
     return (
-        f"{prefix}я могу помочь в нескольких форматах:\n\n"
+        f"{greeting} Я могу помочь в нескольких форматах:\n\n"
         "🃏 карта дня;\n"
         "🌙 подсказка на неделю;\n"
         "🔮 расклад на ситуацию из 3 карт;\n"
         "❓ расклад на вопрос;\n"
         "💬 мягкая поддержка;\n"
         "✨ аффирмации;\n"
-        "🔥 мотивация и настрой.\n\n"
-        "Напиши обычными словами, например: “сделай расклад на смену работы” или “дай 7 аффирмаций на любовь”."
+        "🔥 мотивация и настрой;\n"
+        "🔢 нумерология и символика дат;\n"
+        "🌌 астрологические подсказки.\n\n"
+        "Напиши обычными словами, например: “сделай расклад на смену работы”, “дай 7 аффирмаций на любовь” или “что значит эта дата в нумерологии”."
     )
 
 
@@ -563,18 +744,33 @@ def interpret_card_for_topic(card: str, topic: str, position: str) -> str:
 def handle_tarot(user_id: int, user_text: str, user_name: Optional[str] = None) -> str:
     state = get_user_state(user_id)
     t = norm(user_text)
+    last_topic = (state.get("last_topic") or "").strip()
 
-    # Continuation: user says yes after previous tarot offer/menu.
-    if t in {"да", "давай", "хочу", "можно", "конечно", "ага", "ок", "окей", "подскажи", "сделай"}:
-        last_topic = state.get("last_topic") or "текущая ситуация"
+    # Continuation: user accepts previous offer to look through cards.
+    if is_tarot_continuation(user_text):
+        if not last_topic:
+            update_user_state(user_id, last_intent="clarify", last_topic="", last_format="")
+            return "Давай посмотрим по картам. Только уточни, пожалуйста, тему: работа, отношения, поездка, состояние или конкретный вопрос?"
         update_user_state(user_id, last_intent="tarot_spread", last_topic=last_topic, last_format="3_cards")
-        return tarot_three_cards_answer("Давай посмотрим это через расклад из 3 карт.", f"расклад на {last_topic}")
+        return tarot_three_cards_answer(
+            "Расклад из 3 карт",
+            f"расклад на {last_topic}",
+            ["что сейчас влияет", "что может открыться дальше", "совет карт"],
+        )
 
     if is_plain_tarot_menu_request(user_text):
         update_user_state(user_id, last_intent="tarot_menu", last_topic="", last_format="")
         return tarot_menu(user_name)
 
     topic = extract_topic_after_markers(user_text)
+
+    # One-card formats: card of the day, pull a card, soft hint for today.
+    if is_single_card_request(user_text):
+        single_topic = topic or single_card_topic(user_text) or "день"
+        update_user_state(user_id, last_intent="tarot_single", last_topic=single_topic, last_format="single")
+        format_name = "Карта дня" if "дня" in t or "сегодня" in t else "Одна карта"
+        intro = "Посмотрим мягкую подсказку на сегодня ✨" if format_name == "Карта дня" else "Вытянем одну карту как мягкую подсказку."
+        return tarot_single_answer(format_name, f"карта на {single_topic}", intro=intro)
 
     if "недел" in t:
         update_user_state(user_id, last_intent="tarot_week", last_topic=topic or "неделя", last_format="week")
@@ -592,16 +788,13 @@ def handle_tarot(user_id: int, user_text: str, user_name: Optional[str] = None) 
             ["главная энергия месяца", "зона роста", "совет на месяц"],
         )
 
-    if "карта дня" in t or ("карт" in t and "дня" in t):
-        update_user_state(user_id, last_intent="tarot_day", last_topic="день", last_format="single")
-        return tarot_single_answer("Карта дня", user_text, intro="Посмотрим мягкую подсказку на сегодня ✨")
-
-    # If they ask for a spread with a real topic, do it, not menu.
-    if "расклад" in t or topic:
-        update_user_state(user_id, last_intent="tarot_spread", last_topic=topic or "текущая ситуация", last_format="3_cards")
+    # Explicit spread/card reading request -> 3 cards.
+    if is_spread_request(user_text) or topic:
+        spread_topic = topic or "текущая ситуация"
+        update_user_state(user_id, last_intent="tarot_spread", last_topic=spread_topic, last_format="3_cards")
         return tarot_three_cards_answer(
             "Расклад из 3 карт",
-            user_text if topic else "расклад на текущую ситуацию",
+            f"расклад на {spread_topic}",
             ["что сейчас влияет", "что может открыться дальше", "совет карт"],
         )
 
@@ -665,7 +858,8 @@ def handle_motivation(user_id: int, user_text: str, user_name: Optional[str] = N
 
 
 def handle_support(user_id: int, user_text: str, user_name: Optional[str] = None) -> str:
-    update_user_state(user_id, last_intent="support", last_topic="", last_format="")
+    topic = extract_life_topic(user_text)
+    update_user_state(user_id, last_intent="support", last_topic=topic, last_format="")
     name = first_name_part(user_name)
     context = build_memory_context(user_id)
     prompt = (
@@ -673,16 +867,17 @@ def handle_support(user_id: int, user_text: str, user_name: Optional[str] = None
         "Пользователь пишет, что ему тяжело или нужна поддержка. "
         "Ответь бережно, по-человечески, без медицинских диагнозов и без давления. "
         "Не выдавай меню. Можешь задать один мягкий уточняющий вопрос в конце. "
+        "Если в сообщении есть тема, сохрани её в ответе мягко, но не делай расклад без прямой просьбы о картах. "
         "Без Markdown.\n"
-        f"Имя пользователя: {name or 'неизвестно'}.\n"
+        f"Имя пользователя: {name or 'неизвестно'}. Не обращайся по имени слишком часто.\n"
         f"Контекст последних сообщений:\n{context}\n"
         f"Сообщение пользователя: {user_text}"
     )
-    ai = openrouter_simple(prompt, max_tokens=650)
+    ai = openrouter_simple(prompt, max_tokens=700)
     if ai:
         return clean_vk_text(ai)
     return (
-        f"{maybe_name(user_name)}я рядом. Похоже, сейчас правда непросто. "
+        "Я рядом. Похоже, сейчас правда непросто. "
         "Давай не будем требовать от себя сразу больших решений. Сделай один маленький шаг: выдохни, назови, что именно давит сильнее всего, и напиши мне."
     )
 
@@ -700,12 +895,12 @@ def openrouter_simple(prompt: str, max_tokens: int = 700) -> str:
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
                 "HTTP-Referer": "https://vk.com/",
-                "X-Title": BOT_NAME,
+                "X-Title": "Zaika Chudodey",
             },
             json={
                 "model": OPENROUTER_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.75,
+                "temperature": 0.72,
                 "max_tokens": max_tokens,
             },
             timeout=45,
@@ -738,17 +933,22 @@ def general_openrouter_answer(user_id: int, user_text: str, user_name: Optional[
         f"Ты — {BOT_NAME}, тёплый AI-помощник эзотерико-психологического сообщества. "
         "Отвечай живо, мягко и понятно. Не используй Markdown, решётки, жирный шрифт и кодовые блоки. "
         "Не начинай каждый ответ с приветствия. Не показывай меню без прямой просьбы. "
-        "Если пользователь продолжает прошлую мысль, учитывай контекст. "
-        "Если запрос похож на Таро, а формат не ясен, предложи мягко уточнить или сам выбери простой расклад из 3 карт. "
-        "Не давай медицинские, юридические или финансовые гарантии.\n"
-        f"Имя пользователя: {name or 'неизвестно'}. Иногда можешь обратиться по имени, но не часто.\n"
+        "Если пользователь продолжает прошлую мысль, учитывай контекст, но не цепляй старую тему к новым самостоятельным запросам. "
+        "Если пользователь НЕ просит карты, Таро, расклад или гадание явно, НЕ делай расклад и не притворяйся, что вытянул карты. "
+        "Можно мягко предложить посмотреть через карты в конце, если это уместно. "
+        "Ты можешь отвечать на мягкие вопросы по нумерологии, символике чисел, датам, талисманам, астрологии и энергии дня. "
+        "Если для точного нумерологического или астрологического расчёта не хватает данных, попроси уточнить дату, время, место рождения или методику. "
+        "Не выдумывай точные натальные карты, асцендент, дома гороскопа и сложные расчёты без нужных данных. "
+        "Не давай медицинские, юридические или финансовые гарантии. "
+        "Тон: бережный, образный, но без давления и категоричных предсказаний.\n"
+        f"Имя пользователя: {name or 'неизвестно'}. Не обращайся по имени в обычном ответе, кроме редких случаев, когда это звучит естественно.\n"
         f"Контекст последних сообщений:\n{context}\n"
         f"Новое сообщение пользователя: {user_text}"
     )
-    ai = openrouter_simple(prompt, max_tokens=800)
+    ai = openrouter_simple(prompt, max_tokens=950)
     if ai:
         return clean_vk_text(ai)
-    return capabilities_answer(user_name, compact=True)
+    return soft_general_fallback(user_text)
 
 
 # -----------------------------
@@ -757,7 +957,7 @@ def general_openrouter_answer(user_id: int, user_text: str, user_name: Optional[
 def build_answer(user_id: int, user_text: str, user_name: Optional[str] = None) -> str:
     user_text = (user_text or "").strip()
     if not user_text:
-        return capabilities_answer(user_name, compact=True)
+        return clarify_request(user_text, user_name)
 
     state = get_user_state(user_id)
     if user_name:
@@ -767,13 +967,10 @@ def build_answer(user_id: int, user_text: str, user_name: Optional[str] = None) 
 
     try:
         if is_short_greeting(user_text):
-            if state.get("greeted"):
-                answer = capabilities_answer(user_name, compact=True)
-            else:
-                update_user_state(user_id, greeted=1, last_intent="greeting")
-                answer = capabilities_answer(user_name)
+            update_user_state(user_id, greeted=1, last_intent="greeting", last_topic="", last_format="")
+            answer = capabilities_answer(user_name, compact=bool(state.get("greeted")))
         elif wants_capabilities(user_text):
-            update_user_state(user_id, greeted=1, last_intent="capabilities")
+            update_user_state(user_id, greeted=1, last_intent="capabilities", last_topic="", last_format="")
             answer = capabilities_answer(user_name)
         elif wants_affirmations(user_text):
             answer = handle_affirmations(user_id, user_text, user_name)
@@ -783,14 +980,18 @@ def build_answer(user_id: int, user_text: str, user_name: Optional[str] = None) 
             answer = handle_motivation(user_id, user_text, user_name)
         elif wants_support(user_text):
             answer = handle_support(user_id, user_text, user_name)
+        elif is_ambiguous_request(user_text):
+            update_user_state(user_id, last_intent="clarify", last_topic="", last_format="")
+            answer = clarify_request(user_text, user_name)
         else:
-            # If previous bot offered tarot and user continues with a topic, avoid menu.
-            last_intent = state.get("last_intent") or ""
-            if last_intent in {"tarot_menu", "tarot_offer"} and len(user_text) > 3:
-                answer = handle_tarot(user_id, f"расклад на {user_text}", user_name)
-            else:
-                update_user_state(user_id, last_intent="dialogue")
-                answer = general_openrouter_answer(user_id, user_text, user_name)
+            topic = extract_life_topic(user_text)
+            update_user_state(
+                user_id,
+                last_intent="dialogue",
+                last_topic=topic,
+                last_format="",
+            )
+            answer = general_openrouter_answer(user_id, user_text, user_name)
     except Exception as e:
         print(f"BUILD_ANSWER_ERROR user_id={user_id} error={e}", flush=True)
         answer = "Я рядом, но сейчас чуть споткнулся внутри. Напиши мне ещё раз — лучше чуть проще и конкретнее."
