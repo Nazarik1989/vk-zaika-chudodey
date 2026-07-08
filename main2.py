@@ -54,6 +54,21 @@ def health():
     return "ok", 200
 
 
+@app.route("/health/ai", methods=["GET"])
+def health_ai():
+    ping = str(request.args.get("ping", "")).strip().lower() in {"1", "true", "yes"}
+    result = {
+        "has_openrouter_key": bool(OPENROUTER_API_KEY),
+        "primary_model": OPENROUTER_MODEL,
+        "fallback_models": OPENROUTER_FALLBACK_MODELS,
+    }
+    if ping:
+        answer = openrouter_simple("Ответь одним словом: ok", max_tokens=10)
+        result["ping_ok"] = bool(answer)
+        result["ping_answer_preview"] = answer[:30]
+    return result, 200
+
+
 # -----------------------------
 # Persistent memory
 # -----------------------------
@@ -532,22 +547,10 @@ def is_question_like(text: str) -> bool:
 
 
 def safe_fallback_answer(user_id: int, user_text: str, user_name: Optional[str] = None) -> str:
-    state = get_user_state(user_id)
-    last_intent = state.get("last_intent") or ""
     prefix = maybe_name(user_name)
-    if is_question_like(user_text) and last_intent.startswith("tarot"):
-        return (
-            f"{prefix}если коротко: смотри не на готовый приговор, а на самый живой слой вопроса. "
-            "Что в этой ситуации повторяется, где ты теряешь опору и какой маленький шаг вернёт ясность?"
-        )
-    if is_question_like(user_text):
-        return (
-            f"{prefix}я бы начала с простого: отделить факт от тревоги. "
-            "Что уже точно известно, чего ты боишься, и какой один шаг можно сделать без давления прямо сейчас?"
-        )
     return (
-        f"{prefix}я рядом. Давай спокойно: опиши ситуацию как есть, без идеальной формулировки, "
-        "и я помогу разложить её на понятные шаги."
+        f"{prefix}я рядом, но сейчас не смогла нормально сформулировать ответ. "
+        "Попробуй написать ещё раз через минуту."
     )
 
 
