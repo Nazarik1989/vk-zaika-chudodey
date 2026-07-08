@@ -26,7 +26,15 @@ VK_GROUP_TOKEN = env_value("VK_GROUP_TOKEN")
 VK_CONFIRMATION_TOKEN = env_value("VK_CONFIRMATION_TOKEN")
 VK_SECRET_KEY = env_value("VK_SECRET_KEY")
 OPENROUTER_API_KEY = env_value("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-5.4-mini").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini").strip()
+OPENROUTER_FALLBACK_MODELS = [
+    m.strip()
+    for m in os.getenv(
+        "OPENROUTER_FALLBACK_MODELS",
+        "openai/gpt-4o-mini,openai/gpt-4.1-mini,google/gemini-2.0-flash-001",
+    ).split(",")
+    if m.strip()
+]
 VK_API_VERSION = os.getenv("VK_API_VERSION", "5.199").strip()
 BOT_NAME = os.getenv("BOT_NAME", "Зайка-чудодей").strip()
 VK_GROUP_ID = int(os.getenv("VK_GROUP_ID", "232950079") or "232950079")
@@ -529,17 +537,17 @@ def safe_fallback_answer(user_id: int, user_text: str, user_name: Optional[str] 
     prefix = maybe_name(user_name)
     if is_question_like(user_text) and last_intent.startswith("tarot"):
         return (
-            f"{prefix}вижу, что это вопрос по прошлому раскладу, но не хочу додумывать за тебя. "
-            "Уточни, пожалуйста, что именно разобрать: чувство, причину ситуации, следующий шаг или совет карт?"
+            f"{prefix}если коротко: смотри не на готовый приговор, а на самый живой слой вопроса. "
+            "Что в этой ситуации повторяется, где ты теряешь опору и какой маленький шаг вернёт ясность?"
         )
     if is_question_like(user_text):
         return (
-            f"{prefix}хочу ответить точнее, но сейчас вопрос звучит слишком широко. "
-            "Напиши чуть конкретнее: про какую ситуацию речь и что именно нужно понять?"
+            f"{prefix}я бы начала с простого: отделить факт от тревоги. "
+            "Что уже точно известно, чего ты боишься, и какой один шаг можно сделать без давления прямо сейчас?"
         )
     return (
-        f"{prefix}я рядом. Кажется, я не до конца уловила, что именно нужно сейчас. "
-        "Напиши чуть конкретнее одним предложением, и я продолжу по смыслу."
+        f"{prefix}я рядом. Давай спокойно: опиши ситуацию как есть, без идеальной формулировки, "
+        "и я помогу разложить её на понятные шаги."
     )
 
 
@@ -730,15 +738,12 @@ def is_crisis_message(text: str) -> bool:
 def wants_tarot(text: str, state: Optional[Dict] = None) -> bool:
     t = norm(text)
     tarot_words = [
-        "таро", "расклад", "карт", "аркан", "погада", "вытяни", "вытащи",
-        "что меня ждет", "что мне ждать", "что будет", "энергия недели", "энергия месяца",
-        "стоит ли", "узнать у карт", "посмотри по картам", "давай по картам", "подсказка на неделю",
+        "таро", "расклад", "карта дня", "карту дня", "по картам", "картам",
+        "аркан", "погада", "вытяни карту", "вытащи карту", "вытащи карты", "вытяни карты",
+        "узнать у карт", "посмотри по картам", "давай по картам", "подсказка на неделю",
     ]
     if any(x in t for x in tarot_words):
         return True
-    if state and (state.get("last_intent") or "").startswith("tarot"):
-        if norm_compact(text) in {"да", "давай", "хочу", "можно", "конечно", "ага", "ок", "окей", "подскажи", "сделай"}:
-            return True
     return False
 
 
@@ -1213,13 +1218,16 @@ ZAIKA_SYSTEM_PROMPT = """
 Конституция Зайки-Чудодейки.
 
 Роль.
-Ты — Зайка-Чудодейка, тёплый живой помощник VK-сообщества. Ты поддерживаешь диалог, помогаешь с Таро, аффирмациями, мотивацией, нумерологией, астрологическим фоном, талисманами, именами, символикой и мягкой человеческой поддержкой.
+Ты — Зайка-Чудодейка, тёплый живой собеседник VK-сообщества. Твой первый слой — нормальный связный диалог как у хорошего ChatGPT: понимать контекст, отвечать по сути, помнить последние реплики и не ломать разговор. Второй слой — твой образ и специализации: мягкая поддержка, Таро, нумерология, астрология, талисманы, имена, символика, аффирмации и мотивация.
 
 Главный принцип контекста.
 Всегда учитывай последние сообщения диалога. Если пользователь отвечает коротко после твоего вопроса, продолжай прежнюю тему. Пример: пользователь пишет «волнуюсь», ты спрашиваешь «Что именно тревожит?», пользователь пишет «переезд» — дальше речь идёт о тревоге вокруг переезда.
 
+Главный принцип ответа.
+Сначала будь собеседником, потом специалистом. На обычные вопросы отвечай обычным человеческим ответом, даже если рядом в истории были карты, нумерология или поддержка. Не запускай Таро, нумерологию или астрологию без прямой просьбы пользователя. Если пользователь спрашивает «почему», «как», «что значит», «что делать», отвечай по смыслу, а не требуй переформулировать.
+
 Принцип неуверенности.
-Если смысл нового сообщения неясен, не притворяйся, что понял. Не начинай ответ с «Понял, речь про ...», если пользователь сам ясно не назвал тему. Лучше задай один короткий уточняющий вопрос. Если пользователь задаёт вопрос после расклада или поддержки, считай это продолжением диалога и отвечай по контексту; если контекста не хватает, уточни, какой именно слой разобрать.
+Если смысл нового сообщения неясен, всё равно дай самый полезный безопасный первый ответ из контекста, а затем задай один короткий уточняющий вопрос. Не начинай ответ с «Понял, речь про ...», если пользователь сам ясно не назвал тему. Не отвечай канцелярской заглушкой вроде «вопрос звучит слишком широко».
 
 Память.
 Используй историю последних сообщений, last_topic, last_bot_question и last_intent как опору для продолжения разговора. Когда тема уже известна, не проси пользователя повторять её.
@@ -1258,32 +1266,42 @@ ZAIKA_SYSTEM_PROMPT = """
 
 def openrouter_request_messages(messages: List[Dict[str, str]], max_tokens: int = 700, temperature: float = 0.75) -> str:
     if not OPENROUTER_API_KEY:
+        print("OPENROUTER_ERROR api_key_empty", flush=True)
         return ""
-    try:
-        r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://vk.com/",
-                "X-Title": "Zaika Chudodey VK Bot",
-            },
-            json={
-                "model": OPENROUTER_MODEL,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            },
-            timeout=45,
-        )
-        data = r.json()
-        if "error" in data:
-            print(f"OPENROUTER_ERROR {data['error']}", flush=True)
-            return ""
-        return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-    except Exception as e:
-        print(f"OPENROUTER_EXCEPTION {e}", flush=True)
-        return ""
+    models = []
+    for model in [OPENROUTER_MODEL] + OPENROUTER_FALLBACK_MODELS:
+        if model and model not in models:
+            models.append(model)
+
+    for model in models:
+        try:
+            r = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://vk.com/",
+                    "X-Title": "Zaika Chudodey VK Bot",
+                },
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                },
+                timeout=45,
+            )
+            data = r.json()
+            if "error" in data:
+                print(f"OPENROUTER_ERROR model={model} error={data['error']}", flush=True)
+                continue
+            answer = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if answer:
+                return answer
+            print(f"OPENROUTER_EMPTY model={model}", flush=True)
+        except Exception as e:
+            print(f"OPENROUTER_EXCEPTION model={model} error={e}", flush=True)
+    return ""
 
 
 def ai_history_messages(user_id: int) -> List[Dict[str, str]]:
@@ -1351,11 +1369,11 @@ def build_memory_context(user_id: int) -> str:
 
 def general_openrouter_answer(user_id: int, user_text: str, user_name: Optional[str] = None) -> str:
     task = (
-        "Ответь на новое сообщение пользователя, сохраняя контекст. "
-        "Если пользователь коротко отвечает на твой предыдущий вопрос, продолжай прежнюю тему. "
-        "Если это вопрос после расклада или поддержки, отвечай как на продолжение диалога. "
-        "Если запрос понятный, отвечай сразу. Если данных не хватает, задай один мягкий уточняющий вопрос. "
-        "Не начинай с «Понял, речь про ...», если тема не названа явно."
+        "Ты главный диалоговый слой. Ответь на новое сообщение как ChatGPT в живом личном чате, сохраняя контекст. "
+        "Не переключайся в расклад, нумерологию или астрологию без прямой просьбы пользователя. "
+        "Если пользователь задаёт вопрос после расклада, поддержки или прошлого ответа, отвечай по сути как на продолжение диалога. "
+        "Если вопрос широкий, всё равно дай полезный первый ответ и только затем при необходимости задай один короткий уточняющий вопрос. "
+        "Не используй шаблон «Понял, речь про ...»."
     )
     ai = openrouter_with_history(user_id, task_prompt=task, max_tokens=850, temperature=0.76)
     if ai:
@@ -1405,25 +1423,9 @@ def build_answer(user_id: int, user_text: str, user_name: Optional[str] = None) 
             answer = handle_affirmations(user_id, user_text, user_name)
         elif wants_tarot(user_text, state):
             answer = handle_tarot(user_id, user_text, user_name)
-        elif wants_numerology(user_text):
-            answer = handle_numerology_astrology(user_id, user_text, "numerology")
-        elif wants_astrology(user_text):
-            answer = handle_numerology_astrology(user_id, user_text, "astrology")
-        elif wants_symbolic(user_text):
-            answer = handle_symbolic(user_id, user_text)
-        elif wants_motivation(user_text):
-            answer = handle_motivation(user_id, user_text, user_name)
-        elif wants_support(user_text):
-            answer = handle_support(user_id, user_text, user_name)
         else:
-            last_intent = state.get("last_intent") or ""
-            if last_intent == "tarot_ask_topic" and len(user_text) > 2:
-                answer = handle_tarot(user_id, f"расклад на {user_text}", user_name)
-            elif last_intent == "date_clarify" and contextual_topic:
-                answer = general_openrouter_answer(user_id, user_text, user_name)
-            else:
-                update_user_state(user_id, last_intent="dialogue", last_topic=contextual_topic or state.get("last_topic") or "", last_format="")
-                answer = general_openrouter_answer(user_id, user_text, user_name)
+            update_user_state(user_id, last_intent="dialogue", last_topic=contextual_topic or state.get("last_topic") or "", last_format="")
+            answer = general_openrouter_answer(user_id, user_text, user_name)
     except Exception as e:
         print(f"BUILD_ANSWER_ERROR user_id={user_id} error={e}", flush=True)
         answer = "Я рядом, но сейчас чуть споткнулся внутри. Напиши мне ещё раз — лучше чуть проще и конкретнее."
