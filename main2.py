@@ -388,6 +388,34 @@ def is_closing_reply(text: str) -> bool:
     return len(t.split()) <= 5 and any(word in t for word in calm_words)
 
 
+def is_confusion_reply(text: str) -> bool:
+    t = norm_compact(text)
+    exact_phrases = {
+        "не понятно",
+        "непонятно",
+        "не поняла",
+        "не понял",
+        "не понимаю",
+        "не поняла тебя",
+        "не понял тебя",
+        "объясни проще",
+        "можно проще",
+        "что это значит",
+        "не ясно",
+        "неясно",
+        "ничего не понятно",
+        "ничего не поняла",
+        "ничего не понял",
+        "я не поняла",
+        "я не понял",
+        "и что это значит",
+    }
+    if t in exact_phrases:
+        return True
+    confusion_markers = ("не понят", "непонят", "не понимаю", "не ясно", "неясно")
+    return len(t.split()) <= 6 and any(marker in t for marker in confusion_markers)
+
+
 def count_requested(text: str, default: int = 5, min_count: int = 1, max_count: int = 20) -> int:
     m = re.search(r"\b(\d{1,2})\b", text or "")
     if not m:
@@ -421,6 +449,7 @@ def extract_topic_after_markers(text: str) -> str:
         if m:
             topic = m.group(1).strip(" .?!,:;—-")
             topic = re.sub(r"^(сейчас|сегодня|пожалуйста|плиз|мне|я|давай)\s+", "", topic).strip()
+            topic = clean_extracted_topic(topic)
             if topic and topic not in {"расклад", "таро", "карту", "карта", "карты", "совет", "подсказку", "по картам"}:
                 return topic[:180]
 
@@ -431,9 +460,17 @@ def extract_topic_after_markers(text: str) -> str:
         flags=re.I,
     )
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .?!,:;—-")
+    cleaned = clean_extracted_topic(cleaned)
     if len(cleaned) >= 4 and cleaned not in {"картам", "картам расклад", "расклад картам"}:
         return cleaned[:180]
     return ""
+
+
+def clean_extracted_topic(topic: str) -> str:
+    topic = norm(topic).strip(" .?!,:;—-")
+    topic = re.sub(r"^(таро|карты|картам|расклад|на вопрос|вопрос)\s*[,.:;—-]*\s*", "", topic).strip()
+    topic = re.sub(r"^(на вопрос|вопрос)\s*[,.:;—-]*\s*", "", topic).strip()
+    return topic
 
 
 def is_probable_topic_fragment(text: str) -> bool:
@@ -441,6 +478,8 @@ def is_probable_topic_fragment(text: str) -> bool:
     if not t or len(t) < 3:
         return False
     if is_closing_reply(t):
+        return False
+    if is_confusion_reply(t):
         return False
     if len(t.split()) > 5:
         return False
@@ -453,6 +492,8 @@ def is_probable_topic_fragment(text: str) -> bool:
 
 def infer_contextual_topic(user_text: str, state: Dict) -> str:
     if is_closing_reply(user_text):
+        return ""
+    if is_confusion_reply(user_text):
         return ""
     if norm_compact(user_text) in {"давай по картам", "посмотри по картам", "по картам", "давай", "да", "хочу", "можно", "ок", "окей", "сделай"}:
         return ""
@@ -744,6 +785,30 @@ def resolve_tarot_topic(text: str, state: Dict, mode: str) -> str:
     return (state.get("last_topic") or "").strip()
 
 
+def is_unclear_tarot_topic(topic: str) -> bool:
+    t = norm_compact(topic)
+    if not t or t in {"текущая ситуация", "ситуация", "вопрос"}:
+        return True
+    if re.search(r"\bделать мне\b", t):
+        return True
+    decision_words = {"делать", "идти", "ехать", "писать", "покупать", "продавать", "увольняться", "начинать", "соглашаться"}
+    clear_decision_markers = {
+        "или нет", "стоит ли", "можно ли", "нужно ли", "надо ли", "правильно ли",
+        "получится ли", "что будет если", "лучше ли",
+    }
+    if any(word in t.split() for word in decision_words) and not any(marker in t for marker in clear_decision_markers):
+        return True
+    return False
+
+
+def tarot_unclear_question_answer() -> str:
+    return (
+        "Я поняла, что нужен расклад, но сам вопрос сейчас звучит неясно. "
+        "Напиши его в форме: «стоит ли мне ...», «делать или нет ...» или «что будет, если ...». "
+        "Так карты будут отвечать на настоящий вопрос, а не на сырой текст."
+    )
+
+
 # -----------------------------
 # Bot answers
 # -----------------------------
@@ -764,6 +829,19 @@ def closing_answer(user_text: str, user_name: Optional[str] = None) -> str:
     if any(word in t for word in ("спасибо", "благодарю", "благодарна", "благодарен")):
         return f"{prefix}пожалуйста. Я рядом, если снова захочется что-то разобрать."
     return f"{prefix}очень рада. Тогда просто бережно продолжаем день."
+
+
+def confusion_answer(user_id: int, user_name: Optional[str] = None) -> str:
+    state = get_user_state(user_id)
+    last_intent = state.get("last_intent") or ""
+    prefix = maybe_name(user_name)
+    if last_intent.startswith("tarot"):
+        return (
+            f"{prefix}объясню проще: карты не говорят точное «да» или «нет». "
+            "Они показывают, где есть напряжение, где ресурс и какой шаг будет спокойнее. "
+            "Если хочешь, напиши вопрос в формате «стоит ли мне ...» или «делать или нет ...», и я разберу понятнее."
+        )
+    return f"{prefix}поняла. Скажу проще: напиши, какой момент смутил, и я объясню без лишних слов."
 
 
 def capabilities_answer(user_name: Optional[str] = None) -> str:
@@ -828,14 +906,16 @@ def tarot_fallback_single(mode: str, topic: str, card: str) -> str:
 
 def tarot_fallback_spread(topic: str, cards: List[str]) -> str:
     positions = ["что сейчас влияет", "что может открыться дальше", "совет карт"]
+    position_notes = [
+        "Это фон ситуации: что сейчас давит, поддерживает или требует честного взгляда.",
+        "Это возможный следующий слой, а не обещание события. Смотри, где появится больше ясности.",
+        "Здесь фокус на ближайшем шаге: что поможет сохранить опору и не действовать из паники.",
+    ]
     lines = [f"Расклад из 3 карт на тему «{topic}».", ""]
     for i, (position, card) in enumerate(zip(positions, cards), start=1):
         meaning = TAROT_MEANINGS.get(card, "символическая подсказка")
         lines.append(f"{i}. {position}: {card}.")
-        lines.append(
-            f"Смысл карты: {meaning}. В этой позиции она показывает один важный слой ситуации и помогает увидеть, "
-            "на что сейчас стоит обратить внимание без спешки и давления."
-        )
+        lines.append(f"Смысл карты: {meaning}. {position_notes[i - 1]}")
         if i == 3:
             lines.append(f"Совет: {varied_advice(card, topic)}")
         lines.append("")
@@ -892,6 +972,9 @@ def handle_tarot(user_id: int, user_text: str, user_name: Optional[str] = None) 
     topic = resolve_tarot_topic(user_text, state, mode)
     if not topic:
         topic = "текущая ситуация"
+    if mode in {"spread", "single"} and is_unclear_tarot_topic(topic):
+        update_user_state(user_id, last_intent="tarot_ask_topic", last_bot_question="Какой вопрос разобрать по картам?")
+        return tarot_unclear_question_answer()
 
     if mode == "day":
         cards = draw_cards(1)
@@ -1188,7 +1271,8 @@ def general_openrouter_answer(user_id: int, user_text: str, user_name: Optional[
         return clean_vk_text(ai)
 
     state = get_user_state(user_id)
-    topic = infer_contextual_topic(user_text, state) or state.get("last_topic") or user_text.strip()[:120]
+    contextual_topic = infer_contextual_topic(user_text, state)
+    topic = contextual_topic or state.get("last_topic") or ""
     if topic and is_probable_topic_fragment(topic):
         return (
             f"Понял, речь про {topic}. Давай посмотрим на это спокойно: что в этой теме сейчас тревожит сильнее всего — "
@@ -1213,6 +1297,7 @@ def build_answer(user_id: int, user_text: str, user_name: Optional[str] = None) 
     if not contextual_topic and is_probable_topic_fragment(user_text) and not (
         is_short_greeting(user_text)
         or is_closing_reply(user_text)
+        or is_confusion_reply(user_text)
         or wants_capabilities(user_text)
         or is_standalone_date_query(user_text)
         or wants_support(user_text)
@@ -1240,6 +1325,8 @@ def build_answer(user_id: int, user_text: str, user_name: Optional[str] = None) 
             answer = greeting_answer(user_name)
         elif is_closing_reply(user_text):
             answer = closing_answer(user_text, user_name)
+        elif is_confusion_reply(user_text):
+            answer = confusion_answer(user_id, user_name)
         elif wants_capabilities(user_text):
             update_user_state(user_id, greeted=1, last_intent="capabilities", last_format="menu")
             answer = capabilities_answer(user_name)
