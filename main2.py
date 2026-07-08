@@ -503,11 +503,44 @@ def infer_contextual_topic(user_text: str, state: Dict) -> str:
     last_intent = state.get("last_intent") or ""
     last_question = norm(state.get("last_bot_question") or "")
     if is_probable_topic_fragment(user_text) and (
-        last_intent in {"support", "dialogue", "date_clarify"}
-        or any(word in last_question for word in ["что именно", "о чем", "какую тему", "что тревожит", "что хочешь"])
+        last_intent in {"date_clarify"}
+        or any(word in last_question for word in ["о какой теме", "какую тему", "о чем сделать", "что именно тревожит", "что тревожит сильнее"])
     ):
         return user_text.strip()[:180]
     return ""
+
+
+def is_question_like(text: str) -> bool:
+    raw = (text or "").strip()
+    t = norm_compact(raw)
+    if not t:
+        return False
+    question_starts = (
+        "что", "как", "почему", "зачем", "когда", "где", "куда", "откуда",
+        "какой", "какая", "какие", "какую", "можно ли", "стоит ли", "нужно ли",
+        "надо ли", "получится ли", "будет ли", "есть ли",
+    )
+    return raw.endswith("?") or t.startswith(question_starts)
+
+
+def safe_fallback_answer(user_id: int, user_text: str, user_name: Optional[str] = None) -> str:
+    state = get_user_state(user_id)
+    last_intent = state.get("last_intent") or ""
+    prefix = maybe_name(user_name)
+    if is_question_like(user_text) and last_intent.startswith("tarot"):
+        return (
+            f"{prefix}вижу, что это вопрос по прошлому раскладу, но не хочу додумывать за тебя. "
+            "Уточни, пожалуйста, что именно разобрать: чувство, причину ситуации, следующий шаг или совет карт?"
+        )
+    if is_question_like(user_text):
+        return (
+            f"{prefix}хочу ответить точнее, но сейчас вопрос звучит слишком широко. "
+            "Напиши чуть конкретнее: про какую ситуацию речь и что именно нужно понять?"
+        )
+    return (
+        f"{prefix}я рядом. Кажется, я не до конца уловила, что именно нужно сейчас. "
+        "Напиши чуть конкретнее одним предложением, и я продолжу по смыслу."
+    )
 
 
 def extract_last_bot_question(answer: str) -> str:
@@ -678,6 +711,7 @@ def wants_support(text: str) -> bool:
         "тяжело", "плохо", "грустно", "страшно", "тревожно", "тревога", "волнуюсь", "устала", "устал", "выгорел",
         "выгорела", "не могу", "не получается", "нет сил", "поддержи", "хочу поговорить",
         "сомневаюсь", "переживаю", "паника", "одиноко", "не знаю что делать", "опустились руки",
+        "боюсь", "страх", "страшно", "нервничаю", "переживаю", "не справлюсь", "боюсь навредить",
     ]
     return any(x in t for x in support_words)
 
@@ -799,6 +833,26 @@ def is_unclear_tarot_topic(topic: str) -> bool:
     if any(word in t.split() for word in decision_words) and not any(marker in t for marker in clear_decision_markers):
         return True
     return False
+
+
+def is_high_stakes_decision_topic(topic: str) -> bool:
+    t = norm_compact(topic)
+    financial_risk = (
+        "все деньги", "все свои деньги", "последние деньги", "вложить деньги",
+        "вложить все", "инвестировать", "кредит", "ипотека", "займ", "долг",
+    )
+    legal_health_risk = (
+        "суд", "иск", "развод", "операция", "лечение", "таблетки", "диагноз",
+    )
+    return any(x in t for x in financial_risk + legal_health_risk)
+
+
+def high_stakes_decision_answer() -> str:
+    return (
+        "Я не хочу решать такой вопрос картами вместо реальной проверки рисков. "
+        "Если речь про деньги, здоровье или юридические последствия, лучше сначала собрать факты и посоветоваться со специалистом. "
+        "Могу помочь мягко разобрать, чего ты боишься, какие есть риски и какой самый безопасный следующий шаг."
+    )
 
 
 def tarot_unclear_question_answer() -> str:
@@ -972,6 +1026,9 @@ def handle_tarot(user_id: int, user_text: str, user_name: Optional[str] = None) 
     topic = resolve_tarot_topic(user_text, state, mode)
     if not topic:
         topic = "текущая ситуация"
+    if mode in {"spread", "single"} and is_high_stakes_decision_topic(topic):
+        update_user_state(user_id, last_intent="dialogue", last_topic=topic, last_format="")
+        return high_stakes_decision_answer()
     if mode in {"spread", "single"} and is_unclear_tarot_topic(topic):
         update_user_state(user_id, last_intent="tarot_ask_topic", last_bot_question="Какой вопрос разобрать по картам?")
         return tarot_unclear_question_answer()
@@ -1132,6 +1189,9 @@ ZAIKA_SYSTEM_PROMPT = """
 Главный принцип контекста.
 Всегда учитывай последние сообщения диалога. Если пользователь отвечает коротко после твоего вопроса, продолжай прежнюю тему. Пример: пользователь пишет «волнуюсь», ты спрашиваешь «Что именно тревожит?», пользователь пишет «переезд» — дальше речь идёт о тревоге вокруг переезда.
 
+Принцип неуверенности.
+Если смысл нового сообщения неясен, не притворяйся, что понял. Не начинай ответ с «Понял, речь про ...», если пользователь сам ясно не назвал тему. Лучше задай один короткий уточняющий вопрос. Если пользователь задаёт вопрос после расклада или поддержки, считай это продолжением диалога и отвечай по контексту; если контекста не хватает, уточни, какой именно слой разобрать.
+
 Память.
 Используй историю последних сообщений, last_topic, last_bot_question и last_intent как опору для продолжения разговора. Когда тема уже известна, не проси пользователя повторять её.
 
@@ -1264,21 +1324,15 @@ def general_openrouter_answer(user_id: int, user_text: str, user_name: Optional[
     task = (
         "Ответь на новое сообщение пользователя, сохраняя контекст. "
         "Если пользователь коротко отвечает на твой предыдущий вопрос, продолжай прежнюю тему. "
-        "Если запрос понятный, отвечай сразу. Если данных не хватает, задай один мягкий уточняющий вопрос."
+        "Если это вопрос после расклада или поддержки, отвечай как на продолжение диалога. "
+        "Если запрос понятный, отвечай сразу. Если данных не хватает, задай один мягкий уточняющий вопрос. "
+        "Не начинай с «Понял, речь про ...», если тема не названа явно."
     )
     ai = openrouter_with_history(user_id, task_prompt=task, max_tokens=850, temperature=0.76)
     if ai:
         return clean_vk_text(ai)
 
-    state = get_user_state(user_id)
-    contextual_topic = infer_contextual_topic(user_text, state)
-    topic = contextual_topic or state.get("last_topic") or ""
-    if topic and is_probable_topic_fragment(topic):
-        return (
-            f"Понял, речь про {topic}. Давай посмотрим на это спокойно: что в этой теме сейчас тревожит сильнее всего — "
-            "сам факт перемен, неопределённость, люди вокруг или практические дела?"
-        )
-    return gentle_retry_answer(user_name)
+    return safe_fallback_answer(user_id, user_text, user_name)
 
 
 # -----------------------------
@@ -1294,21 +1348,6 @@ def build_answer(user_id: int, user_text: str, user_name: Optional[str] = None) 
 
     state = get_user_state(user_id)
     contextual_topic = infer_contextual_topic(user_text, state)
-    if not contextual_topic and is_probable_topic_fragment(user_text) and not (
-        is_short_greeting(user_text)
-        or is_closing_reply(user_text)
-        or is_confusion_reply(user_text)
-        or wants_capabilities(user_text)
-        or is_standalone_date_query(user_text)
-        or wants_support(user_text)
-        or wants_tarot(user_text, state)
-        or wants_affirmations(user_text)
-        or wants_motivation(user_text)
-        or wants_numerology(user_text)
-        or wants_astrology(user_text)
-        or wants_symbolic(user_text)
-    ):
-        contextual_topic = user_text.strip()[:180]
 
     if contextual_topic:
         update_user_state(user_id, last_topic=contextual_topic)
