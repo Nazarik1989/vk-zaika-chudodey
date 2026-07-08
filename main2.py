@@ -328,7 +328,7 @@ def norm(text: str) -> str:
 
 
 def norm_compact(text: str) -> str:
-    return re.sub(r"[.!?,;:…\-—\s]+", " ", norm(text)).strip()
+    return re.sub(r"[^0-9a-zа-я]+", " ", norm(text)).strip()
 
 
 def first_name_part(name: Optional[str]) -> str:
