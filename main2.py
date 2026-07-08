@@ -63,7 +63,7 @@ def health_ai():
         "fallback_models": OPENROUTER_FALLBACK_MODELS,
     }
     if ping:
-        answer = openrouter_simple("Ответь одним словом: ok", max_tokens=10)
+        answer = openrouter_simple("Ответь одним словом: ok", max_tokens=20)
         result["ping_ok"] = bool(answer)
         result["ping_answer_preview"] = answer[:30]
     return result, 200
