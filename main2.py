@@ -823,6 +823,8 @@ def is_unclear_tarot_topic(topic: str) -> bool:
     t = norm_compact(topic)
     if not t or t in {"текущая ситуация", "ситуация", "вопрос"}:
         return True
+    if is_incomplete_relation_topic(t):
+        return True
     if re.search(r"\bделать мне\b", t):
         return True
     decision_words = {"делать", "идти", "ехать", "писать", "покупать", "продавать", "увольняться", "начинать", "соглашаться"}
@@ -833,6 +835,33 @@ def is_unclear_tarot_topic(topic: str) -> bool:
     if any(word in t.split() for word in decision_words) and not any(marker in t for marker in clear_decision_markers):
         return True
     return False
+
+
+def is_incomplete_relation_topic(topic: str) -> bool:
+    t = norm_compact(topic)
+    relation_markers = (
+        "относится", "чувствует", "думает", "как относится", "что чувствует", "какие чувства", "что думает",
+        "что думает обо", "что думает о", "любит ли", "скучает ли",
+    )
+    if not any(marker in t for marker in relation_markers):
+        return False
+
+    explicit_object_markers = (
+        "ко мне", "к мне", "к нему", "к ней", "к нам", "к тебе", "к нему",
+        "к сыну", "к дочери", "к ребенку", "к ребёнку", "к мужу", "к жене",
+        "обо мне", "о мне", "о нем", "о нём", "о ней", "о нас", "об отношениях",
+        "меня", "тебя", "его", "ее", "её", "нас",
+    )
+    if any(marker in t for marker in explicit_object_markers):
+        return False
+    if re.search(r"\bк[о]?\s+(?!относится|чувствует|думает|любит|скучает)\w+", t):
+        return False
+    if re.search(r"\bо(?:бо)?\s+(?!относится|чувствует|думает|любит|скучает)\w+", t):
+        return False
+
+    if re.search(r"\bк[о]?\s+(относится|чувствует|думает)\b", t):
+        return True
+    return True
 
 
 def is_high_stakes_decision_topic(topic: str) -> bool:
@@ -858,7 +887,7 @@ def high_stakes_decision_answer() -> str:
 def tarot_unclear_question_answer() -> str:
     return (
         "Я поняла, что нужен расклад, но сам вопрос сейчас звучит неясно. "
-        "Напиши его в форме: «стоит ли мне ...», «делать или нет ...» или «что будет, если ...». "
+        "Напиши его в форме: «стоит ли мне ...», «делать или нет ...», «что будет, если ...» или «как X относится ко мне». "
         "Так карты будут отвечать на настоящий вопрос, а не на сырой текст."
     )
 
