@@ -34,6 +34,7 @@ VK_MEMBERS_ONLY = os.getenv("VK_MEMBERS_ONLY", "true").strip().lower() in {"1", 
 DB_PATH = os.getenv("DB_PATH", "zaika_memory.db").strip()
 MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "40") or "40")
 AI_HISTORY_MESSAGES = max(8, min(18, int(os.getenv("AI_HISTORY_MESSAGES", "16") or "16")))
+LAST_TOPIC_TTL_HOURS = max(1, min(24, int(os.getenv("LAST_TOPIC_TTL_HOURS", "2") or "2")))
 DUPLICATE_TEXT_COOLDOWN_SECONDS = int(os.getenv("DUPLICATE_TEXT_COOLDOWN_SECONDS", "12") or "12")
 
 
@@ -50,6 +51,17 @@ def health():
 # -----------------------------
 def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds")
+
+
+def is_recent_iso(value: str, max_age_hours: int) -> bool:
+    if not value:
+        return False
+    try:
+        created = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    age_seconds = (datetime.utcnow() - created).total_seconds()
+    return 0 <= age_seconds <= max_age_hours * 3600
 
 
 def db_connect():
@@ -74,12 +86,14 @@ def init_db() -> None:
                 greeted INTEGER DEFAULT 0,
                 last_intent TEXT,
                 last_topic TEXT,
+                last_topic_at TEXT,
                 last_bot_question TEXT,
                 last_format TEXT,
                 updated_at TEXT
             )
             """
         )
+        ensure_column(conn, "users", "last_topic_at", "TEXT")
         ensure_column(conn, "users", "last_bot_question", "TEXT")
         ensure_column(conn, "users", "last_format", "TEXT")
         cur.execute(
@@ -129,28 +143,42 @@ def get_user_state(user_id: int) -> Dict:
                 "greeted": 0,
                 "last_intent": "",
                 "last_topic": "",
+                "last_topic_at": "",
                 "last_bot_question": "",
                 "last_format": "",
             }
         data = dict(row)
+        data.setdefault("last_topic_at", "")
         data.setdefault("last_bot_question", "")
         data.setdefault("last_format", "")
+        topic_time = data.get("last_topic_at") or data.get("updated_at") or ""
+        if data.get("last_topic") and not is_recent_iso(topic_time, LAST_TOPIC_TTL_HOURS):
+            data["last_topic"] = ""
+            data["last_topic_at"] = ""
         return data
 
 
 def update_user_state(user_id: int, **kwargs) -> None:
     state = get_user_state(user_id)
+    previous_topic = state.get("last_topic") or ""
+    if "last_topic" in kwargs:
+        new_topic = kwargs.get("last_topic") or ""
+        if new_topic and new_topic != previous_topic:
+            kwargs.setdefault("last_topic_at", now_iso())
+        elif not new_topic:
+            kwargs.setdefault("last_topic_at", "")
     state.update(kwargs)
     with db_connect() as conn:
         conn.execute(
             """
-            INSERT INTO users (user_id, user_name, greeted, last_intent, last_topic, last_bot_question, last_format, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO users (user_id, user_name, greeted, last_intent, last_topic, last_topic_at, last_bot_question, last_format, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 user_name=excluded.user_name,
                 greeted=excluded.greeted,
                 last_intent=excluded.last_intent,
                 last_topic=excluded.last_topic,
+                last_topic_at=excluded.last_topic_at,
                 last_bot_question=excluded.last_bot_question,
                 last_format=excluded.last_format,
                 updated_at=excluded.updated_at
@@ -161,6 +189,7 @@ def update_user_state(user_id: int, **kwargs) -> None:
                 int(state.get("greeted") or 0),
                 state.get("last_intent") or "",
                 state.get("last_topic") or "",
+                state.get("last_topic_at") or "",
                 state.get("last_bot_question") or "",
                 state.get("last_format") or "",
                 now_iso(),
@@ -322,6 +351,43 @@ def is_short_greeting(text: str) -> bool:
     return t in {"привет", "здравствуй", "здравствуйте", "добрый день", "доброе утро", "добрый вечер", "хай", "ку", "hello", "hi"}
 
 
+def is_closing_reply(text: str) -> bool:
+    t = norm_compact(text)
+    exact_phrases = {
+        "спасибо",
+        "спасибочки",
+        "благодарю",
+        "благодарю милый зайчик",
+        "спасибо зайчик",
+        "спасибо милый зайчик",
+        "спасибо большое",
+        "большое спасибо",
+        "спасибо тебе",
+        "все отлично",
+        "всё отлично",
+        "все хорошо",
+        "всё хорошо",
+        "все хорошо спасибо",
+        "всё хорошо спасибо",
+        "все нормально",
+        "всё нормально",
+        "все ок",
+        "всё ок",
+        "все супер",
+        "всё супер",
+        "не нужно",
+        "не надо",
+        "пока хватит",
+    }
+    if t in exact_phrases:
+        return True
+    thanks_words = ("спасибо", "благодарю", "благодарна", "благодарен")
+    calm_words = ("все хорошо", "всё хорошо", "все отлично", "всё отлично", "все нормально", "всё нормально", "все ок", "всё ок")
+    if len(t.split()) <= 6 and any(word in t for word in thanks_words):
+        return True
+    return len(t.split()) <= 5 and any(word in t for word in calm_words)
+
+
 def count_requested(text: str, default: int = 5, min_count: int = 1, max_count: int = 20) -> int:
     m = re.search(r"\b(\d{1,2})\b", text or "")
     if not m:
@@ -374,6 +440,8 @@ def is_probable_topic_fragment(text: str) -> bool:
     t = norm_compact(text)
     if not t or len(t) < 3:
         return False
+    if is_closing_reply(t):
+        return False
     if len(t.split()) > 5:
         return False
     service_words = {
@@ -384,6 +452,8 @@ def is_probable_topic_fragment(text: str) -> bool:
 
 
 def infer_contextual_topic(user_text: str, state: Dict) -> str:
+    if is_closing_reply(user_text):
+        return ""
     if norm_compact(user_text) in {"давай по картам", "посмотри по картам", "по картам", "давай", "да", "хочу", "можно", "ок", "окей", "сделай"}:
         return ""
     topic = extract_topic_after_markers(user_text) if has_explicit_topic_marker(user_text) else ""
@@ -686,6 +756,14 @@ def greeting_answer(user_name: Optional[str] = None) -> str:
         f"{maybe_name(user_name)}привет. Я рядом — можешь написать, что тревожит, какой вопрос хочется разобрать, "
         "или попросить карту дня."
     )
+
+
+def closing_answer(user_text: str, user_name: Optional[str] = None) -> str:
+    t = norm_compact(user_text)
+    prefix = maybe_name(user_name)
+    if any(word in t for word in ("спасибо", "благодарю", "благодарна", "благодарен")):
+        return f"{prefix}пожалуйста. Я рядом, если снова захочется что-то разобрать."
+    return f"{prefix}очень рада. Тогда просто бережно продолжаем день."
 
 
 def capabilities_answer(user_name: Optional[str] = None) -> str:
@@ -1134,6 +1212,7 @@ def build_answer(user_id: int, user_text: str, user_name: Optional[str] = None) 
     contextual_topic = infer_contextual_topic(user_text, state)
     if not contextual_topic and is_probable_topic_fragment(user_text) and not (
         is_short_greeting(user_text)
+        or is_closing_reply(user_text)
         or wants_capabilities(user_text)
         or is_standalone_date_query(user_text)
         or wants_support(user_text)
@@ -1159,6 +1238,8 @@ def build_answer(user_id: int, user_text: str, user_name: Optional[str] = None) 
         elif is_short_greeting(user_text):
             update_user_state(user_id, greeted=1, last_intent="greeting", last_format="")
             answer = greeting_answer(user_name)
+        elif is_closing_reply(user_text):
+            answer = closing_answer(user_text, user_name)
         elif wants_capabilities(user_text):
             update_user_state(user_id, greeted=1, last_intent="capabilities", last_format="menu")
             answer = capabilities_answer(user_name)
