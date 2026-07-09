@@ -1,4 +1,4 @@
-# VK Community Agent
+# Zayka AI Community Assistant
 
 AI-powered community assistant for subscriber engagement, motivation, affirmations and Tarot interpretation workflows.
 
