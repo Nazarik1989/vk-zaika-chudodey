@@ -14,6 +14,20 @@ The goal is to create a warm, interactive community experience while reducing ma
 
 ---
 
+## Screenshots
+
+### Main Interface
+
+![Main Interface](Снимок%20экрана%20(953).png)
+
+### Motivation Workflow
+
+![Motivation Workflow](Снимок%20экрана%20(954).png)
+
+### Tarot Interpretation
+
+![Tarot Workflow](Снимок%20экрана%20(955).png)
+
 ## Features
 
 - AI-powered subscriber conversations
